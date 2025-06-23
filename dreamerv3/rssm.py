@@ -29,7 +29,7 @@ class RSSM(nj.Module):
   dynlayers: int = 1
   absolute: bool = False
   blocks: int = 8
-  free_nats: float = 1.0
+  free_nats: float = 1.0 
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
@@ -38,23 +38,31 @@ class RSSM(nj.Module):
 
   @property
   def entry_space(self):
+    # elements is maintained by Danijar: https://github.com/danijar/elements
+    # .Space(dtype, shape)
     return dict(
         deter=elements.Space(np.float32, self.deter),
         stoch=elements.Space(np.float32, (self.stoch, self.classes)))
 
   def initial(self, bsize):
+    # zeros and transform to bfloat16
     carry = nn.cast(dict(
+        # [batch_size, D]
         deter=jnp.zeros([bsize, self.deter], f32),
         stoch=jnp.zeros([bsize, self.stoch, self.classes], f32)))
     return carry
 
   def truncate(self, entries, carry=None):
+    # [batch_size, time_step, D]
     assert entries['deter'].ndim == 3, entries['deter'].shape
+    # take only the latest step for each node
     carry = jax.tree.map(lambda x: x[:, -1], entries)
     return carry
 
   def starts(self, entries, carry, nlast):
-    B = len(jax.tree.leaves(carry)[0])
+    # batch size = B
+    B = len(jax.tree.leaves(carry)[0]) 
+    # extract nlast steps then flatten B*nlast
     return jax.tree.map(
         lambda x: x[:, -nlast:].reshape((B * nlast, *x.shape[2:])), entries)
 
@@ -73,8 +81,11 @@ class RSSM(nj.Module):
       return carry, entries, feat
 
   def _observe(self, carry, tokens, action, reset, training):
+    # mask(xs, mask)
     deter, stoch, action = nn.mask(
         (carry['deter'], carry['stoch'], action), ~reset)
+    # action space defined in ./embodied/envs/minecraft_flat.py
+    # .DictConcat defined in ./embodied/jax/nets.py
     action = nn.DictConcat(self.act_space, 1)(action)
     action = nn.mask(action, ~reset)
     deter = self._core(deter, stoch, action)

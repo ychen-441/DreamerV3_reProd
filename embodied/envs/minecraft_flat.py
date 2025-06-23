@@ -106,6 +106,7 @@ class Diamond(embodied.Wrapper):
 
 
 BASIC_ACTIONS = {
+    # value of dicts indicates how to perform the action
     'noop': dict(),
     'attack': dict(attack=1),
     'turn_up': dict(camera=(-15, 0)),
@@ -164,6 +165,7 @@ class MinecraftBase(embodied.Env):
 
   LOCK = threading.Lock()
   NOOP = dict(
+      # NO OPeration, i.e., do nothing, default control signals
       camera=(0, 0), forward=0, back=0, left=0, right=0, attack=0, sprint=0,
       jump=0, sneak=0, craft='none', nearbyCraft='none', nearbySmelt='none',
       place='none', equip='none')
@@ -241,6 +243,9 @@ class MinecraftBase(embodied.Env):
   @property
   def act_space(self):
     return {
+        # .Space(dtype, shape, lower bound, upper bound)
+        # .values(): [{}, {'attack:1'}, ...]
+        # tuple(): ({}, {'attack:1'}, ...) -> len() for action indices
         'action': elements.Space(np.int32, (), 0, len(self._action_values)),
         'reset': elements.Space(bool),
     }
@@ -342,6 +347,7 @@ class MinecraftBase(embodied.Env):
     return action
 
   def _insert_defaults(self, actions):
+    # e.g., jump: keep jump action and fill other postions with NOOP
     actions = {name: action.copy() for name, action in actions.items()}
     for key, default in self.NOOP.items():
       for action in actions.values():

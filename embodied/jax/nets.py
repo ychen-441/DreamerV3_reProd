@@ -19,7 +19,9 @@ def cast(xs, force=False):
   if force:
     should = lambda x: True
   else:
+    # only convert floats
     should = lambda x: jnp.issubdtype(x.dtype, jnp.floating)
+    # transform to bfloat16
   return jax.tree.map(lambda x: COMPUTE_DTYPE(x) if should(x) else x, xs)
 
 
@@ -68,12 +70,14 @@ def where(condition, xs, ys):
   assert condition.dtype == bool, condition.dtype
   def fn(x, y):
     assert x.shape == y.shape, (x.shape, y.shape)
+    # expand mask's dim to match that of x
     expanded = jnp.expand_dims(condition, list(range(condition.ndim, x.ndim)))
     return jnp.where(expanded, x, y)
   return jax.tree.map(fn, xs, ys)
 
 
 def mask(xs, mask):
+  # either kept xs or replaced by zeros_like
   return where(mask, xs, jax.tree.map(jnp.zeros_like, xs))
 
 
@@ -82,6 +86,7 @@ def available(*trees, bdims=None):
     masks = []
     for x in xs:
       if jnp.issubdtype(x.dtype, jnp.floating):
+        # zeroed if x = -inf, below's the same
         mask = (x != -jnp.inf)
       elif jnp.issubdtype(x.dtype, jnp.signedinteger):
         mask = (x != -1)
@@ -89,12 +94,15 @@ def available(*trees, bdims=None):
           jnp.issubdtype(x.dtype, jnp.unsignedinteger) or
           jnp.issubdtype(x.dtype, bool)):
         shape = x.shape if bdims is None else x.shape[:bdims]
+        # True for unit and bool
         mask = jnp.full(shape, True, bool)
       else:
         raise NotImplementedError(x.dtype)
       if bdims is not None:
+        # reduce to batch dim only
         mask = mask.all(tuple(range(bdims, mask.ndim)))
       masks.append(mask)
+    # combined mask validity check
     return jnp.stack(masks, 0).all(0)
   return jax.tree.map(fn, *trees)
 
@@ -469,12 +477,13 @@ class DictConcat:
   def __init__(self, spaces, fdims, squish=lambda x: x):
     assert 1 <= fdims, fdims
     self.keys = sorted(spaces.keys())
-    self.spaces = spaces
+    self.spaces = spaces # features
     self.fdims = fdims
     self.squish = squish
 
   def __call__(self, xs):
     assert all(k in xs for k in self.spaces), (self.spaces, xs.keys())
+    # subtract for batch dim
     bdims = xs[self.keys[0]].ndim - len(self.spaces[self.keys[0]].shape)
     ys = []
     for key in self.keys:
@@ -483,18 +492,24 @@ class DictConcat:
       m = available(x, bdims=bdims)
       x = mask(x, m)
       assert x.shape[bdims:] == space.shape, (key, bdims, space.shape, x.shape)
+      # dump if greyscale or RGB image
       if space.dtype == jnp.uint8 and len(space.shape) in (2, 3):
         raise NotImplementedError('Images are not supported.')
       elif space.discrete:
+        # flatten to 1-D telling classes for each dim
         classes = np.asarray(space.classes).flatten()
+        # Promise the same count for all classes for one-hot encoding
         assert (classes == classes[0]).all(), classes
         classes = classes[0].item()
         x = x.astype(jnp.int32)
         x = jax.nn.one_hot(x, classes, dtype=COMPUTE_DTYPE)
       else:
+        # Squish if continuous features
         x = self.squish(x)
         x = x.astype(COMPUTE_DTYPE)
+      # mask agian since we have transformed the org
       x = mask(x, m)
+      # keep leading dims and flatten the others
       x = x.reshape((*x.shape[:bdims + self.fdims - 1], -1))
       ys.append(x)
     return jnp.concatenate(ys, -1)

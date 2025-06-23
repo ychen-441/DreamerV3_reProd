@@ -14,7 +14,10 @@ from . import rssm
 
 f32 = jnp.float32
 i32 = jnp.int32
-sg = lambda xs, skip=False: xs if skip else jax.lax.stop_gradient(xs)
+# concise func def using lambda
+# e.g. def sg(xs, skip=False):..
+# stop gradient as a const
+sg = lambda xs, skip=False: xs if skip else jax.lax.stop_gradient(xs) 
 sample = lambda xs: jax.tree.map(lambda x: x.sample(nj.seed()), xs)
 prefix = lambda xs, p: {f'{p}/{k}': v for k, v in xs.items()}
 concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
