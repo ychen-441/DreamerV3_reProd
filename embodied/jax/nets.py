@@ -86,7 +86,7 @@ def available(*trees, bdims=None):
     masks = []
     for x in xs:
       if jnp.issubdtype(x.dtype, jnp.floating):
-        # zeroed if x = -inf, below's the same
+        # masked out if x = -inf, below's the same
         mask = (x != -jnp.inf)
       elif jnp.issubdtype(x.dtype, jnp.signedinteger):
         mask = (x != -1)
@@ -99,10 +99,14 @@ def available(*trees, bdims=None):
       else:
         raise NotImplementedError(x.dtype)
       if bdims is not None:
-        # reduce to batch dim only
+        # keep mask's dims matching bdims
         mask = mask.all(tuple(range(bdims, mask.ndim)))
       masks.append(mask)
-    # combined mask validity check
+    # An example here: 
+    # xs['action'] = [3, -1, 2], -1 is invalid
+    # xs['reset'] = [1, 0, 1], bool always valid
+    # then masks for them: [T, F, T], [T, T, T]
+    # all(0) gives [T, F, T]
     return jnp.stack(masks, 0).all(0)
   return jax.tree.map(fn, *trees)
 
@@ -476,42 +480,51 @@ class DictConcat:
 
   def __init__(self, spaces, fdims, squish=lambda x: x):
     assert 1 <= fdims, fdims
-    self.keys = sorted(spaces.keys())
-    self.spaces = spaces # features
+    self.keys = sorted(spaces.keys()) # ['action', 'reset']
+    # DictConcat(act_space, 1)
+    # so {'action':.. ,'reset':..}, fdims = 1
+    self.spaces = spaces
     self.fdims = fdims
     self.squish = squish
 
   def __call__(self, xs):
     assert all(k in xs for k in self.spaces), (self.spaces, xs.keys())
-    # subtract for batch dim
+    # len(.shape()) for ndim
+    # subtract for input bdims
     bdims = xs[self.keys[0]].ndim - len(self.spaces[self.keys[0]].shape)
     ys = []
     for key in self.keys:
       space = self.spaces[key]
       x = xs[key]
       m = available(x, bdims=bdims)
+      # example above: m = [T, F, T]
+      # then mask replace invalid value at [1] with 0
+      # for 'action': x = [3, -1, 2] becomes [3, 0, 2]
       x = mask(x, m)
       assert x.shape[bdims:] == space.shape, (key, bdims, space.shape, x.shape)
       # dump if greyscale or RGB image
       if space.dtype == jnp.uint8 and len(space.shape) in (2, 3):
         raise NotImplementedError('Images are not supported.')
+      # danijar/elements: space is discrete if dtype is int/bool
       elif space.discrete:
-        # flatten to 1-D telling classes for each dim
+        # danijar/elements: classes: num of class
         classes = np.asarray(space.classes).flatten()
-        # Promise the same count for all classes for one-hot encoding
+        # flatten and all to ensure the same one-hot size if multi-dim
         assert (classes == classes[0]).all(), classes
         classes = classes[0].item()
         x = x.astype(jnp.int32)
+        # each x as a one-hot vector of length of classes
         x = jax.nn.one_hot(x, classes, dtype=COMPUTE_DTYPE)
       else:
         # Squish if continuous features
         x = self.squish(x)
         x = x.astype(COMPUTE_DTYPE)
-      # mask agian since we have transformed the org
+      # masked out again after dist/con transformations
       x = mask(x, m)
-      # keep leading dims and flatten the others
       x = x.reshape((*x.shape[:bdims + self.fdims - 1], -1))
       ys.append(x)
+    # return masked, concatenated key vectors for each batch
+    # ???[actions; resets; sum of classes] I guess for act_space???
     return jnp.concatenate(ys, -1)
 
 
