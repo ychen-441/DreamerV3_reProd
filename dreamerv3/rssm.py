@@ -53,7 +53,6 @@ class RSSM(nj.Module):
     return carry
 
   def truncate(self, entries, carry=None):
-    # [batch_size, time_step, D]
     assert entries['deter'].ndim == 3, entries['deter'].shape
     # take only the latest step for each node
     carry = jax.tree.map(lambda x: x[:, -1], entries)
@@ -144,19 +143,27 @@ class RSSM(nj.Module):
     return carry, entries, losses, feat, metrics
 
   def _core(self, deter, stoch, action):
+    # keep bdim and flatten stoch and classes dim
     stoch = stoch.reshape((stoch.shape[0], -1))
+    # normalization due to varying scales and magnitudes
+    # sg for avoiding degenerated solutions while keeping numerical stability
     action /= sg(jnp.maximum(1, jnp.abs(action)))
-    g = self.blocks
-    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
-    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    g = self.blocks # 8
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g) # (g,h)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g) # (g*h)
+    # deter/stoch/action encoded into a norm, activated hidden space (2048)
+    # check layer ops in ./embodied/jax/nets.py
     x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deter)
     x0 = nn.act(self.act)(self.sub('dynin0norm', nn.Norm, self.norm)(x0))
     x1 = self.sub('dynin1', nn.Linear, self.hidden, **self.kw)(stoch)
     x1 = nn.act(self.act)(self.sub('dynin1norm', nn.Norm, self.norm)(x1))
     x2 = self.sub('dynin2', nn.Linear, self.hidden, **self.kw)(action)
     x2 = nn.act(self.act)(self.sub('dynin2norm', nn.Norm, self.norm)(x2))
+    # (B, 2048) -> (B, 2048*3) -> (B, 1, 2048*3) -> (B, 8, 2048*3)
     x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    # (B, 4096) -> (B, 8，512); x -> (B, 8, 512+2048*3) -> (B, 8*(512+2048*3))
     x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    
     for i in range(self.dynlayers):
       x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'dynhid{i}norm', nn.Norm, self.norm)(x))

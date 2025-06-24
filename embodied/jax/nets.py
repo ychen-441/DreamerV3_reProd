@@ -26,6 +26,7 @@ def cast(xs, force=False):
 
 
 def act(name):
+  # activation layer def
   if name == 'none':
     return lambda x: x
   elif name == 'mish':
@@ -42,6 +43,7 @@ def act(name):
 
 
 def init(name):
+  # specify initializer if necessary
   if callable(name):
     return name
   elif name.endswith(('_in', '_out', '_avg')):
@@ -111,16 +113,21 @@ def available(*trees, bdims=None):
   return jax.tree.map(fn, *trees)
 
 
+# custom rules using jax.custom_vjp
+# ensuring fwd and bwd pass dtypes are COMPUTE_DTYPE
 @functools.partial(jax.custom_vjp, nondiff_argnums=[1, 2])
 def ensure_dtypes(x, fwd=None, bwd=None):
+  # jnp.bfloat16
   fwd = fwd or COMPUTE_DTYPE
   bwd = bwd or COMPUTE_DTYPE
   assert x.dtype == fwd, (x.dtype, fwd)
   return x
+# forward
 def ensure_dtypes_fwd(x, fwd=None, bwd=None):
   fwd = fwd or COMPUTE_DTYPE
   bwd = bwd or COMPUTE_DTYPE
   return ensure_dtypes(x, fwd, bwd), ()
+# backward
 def ensure_dtypes_bwd(fwd, bwd, cache, dx):
   fwd = fwd or COMPUTE_DTYPE
   bwd = bwd or COMPUTE_DTYPE
@@ -156,8 +163,8 @@ def rope(x, ts=None, inverse=False, maxlen=4096):
 class Initializer:
 
   def __init__(self, dist='trunc_normal', fan='in', scale=1.0):
-    self.dist = dist
-    self.fan = fan
+    self.dist = dist # distribution
+    self.fan = fan # fan-in/-out
     self.scale = scale
 
   def __call__(self, shape, dtype=jnp.float32, fshape=None):
@@ -193,18 +200,25 @@ class Initializer:
     return f'Initializer({self.dist}, {self.fan}, {self.scale})'
 
   def __eq__(self, other):
+    # equality for others if attr's the same
     attributes = ('dist', 'fan', 'scale')
     return all(getattr(self, k) == getattr(other, k) for k in attributes)
 
   @staticmethod
   def compute_fans(shape):
+    # check fan shape if fshape not None
     if len(shape) == 0:
+      # scalar ()
       return (1, 1)
     elif len(shape) == 1:
+      # vector (out,)
       return (1, shape[0])
     elif len(shape) == 2:
+      # matrix (in, out)
       return shape
     else:
+      # e.g., [H, W, in, OUT]
+      # space = H*W, fan-in/-out = in/_out*space
       space = math.prod(shape[:-2])
       return (shape[-2] * space, shape[-1] * space)
 
@@ -239,10 +253,13 @@ class Embed(nj.Module):
     return embed
 
 
+# linear op
 class Linear(nj.Module):
 
   bias: bool = True
+  # weight init
   winit: str | Callable = Initializer('trunc_normal')
+  # bias init
   binit: str | Callable = Initializer('zeros')
   outscale: float = 1.0
 
@@ -250,19 +267,23 @@ class Linear(nj.Module):
     self.units = (units,) if isinstance(units, int) else tuple(units)
 
   def __call__(self, x):
-    ensure_dtypes(x)
-    size = math.prod(self.units)
-    shape = (x.shape[-1], size)
+    ensure_dtypes(x) # check if COMPUTE_DTYPE
+    size = math.prod(self.units) # output_dim
+    shape = (x.shape[-1], size) # (input_dim, output_dim)
+    # use 'kernel' or init it with the followings
     x = x @ self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
     if self.bias:
+      # bias (1, output_dim)
       x += self.value('bias', init(self.binit), size).astype(x.dtype)
     x = x.reshape((*x.shape[:-1], *self.units))
     return x
 
   def _scaled_winit(self, *args, **kwargs):
+    # outscaled init with Linear configs
     return init(self.winit)(*args, **kwargs) * self.outscale
 
 
+# block-wise linear op
 class BlockLinear(nj.Module):
 
   bias: bool = True
@@ -279,11 +300,12 @@ class BlockLinear(nj.Module):
   def __call__(self, x):
     ensure_dtypes(x)
     assert x.shape[-1] % self.blocks == 0, (x.shape, self.blocks)
-    insize = x.shape[-1]
+    insize = x.shape[-1] # input_dim
     shape = (self.blocks, insize // self.blocks, self.units // self.blocks)
+    # init kernel block-wise-ly
     kernel = self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
-    x = x.reshape((*x.shape[:-1], self.blocks, insize // self.blocks))
-    x = jnp.einsum('...ki,kio->...ko', x, kernel)
+    x = x.reshape((*x.shape[:-1], self.blocks, insize // self.blocks)) # flat2group
+    x = jnp.einsum('...ki,kio->...ko', x, kernel) # block-wise matmul
     x = x.reshape((*x.shape[:-2], self.units))
     if self.bias:
       x += self.value('bias', init(self.binit), self.units).astype(x.dtype)
@@ -524,7 +546,7 @@ class DictConcat:
       x = x.reshape((*x.shape[:bdims + self.fdims - 1], -1))
       ys.append(x)
     # return masked, concatenated key vectors for each batch
-    # ???[actions; resets; sum of classes] I guess for act_space???
+    # [actions, resets] with length of sum of classes I guess for act_space
     return jnp.concatenate(ys, -1)
 
 
