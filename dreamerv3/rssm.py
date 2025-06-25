@@ -68,11 +68,15 @@ class RSSM(nj.Module):
   def observe(self, carry, tokens, action, reset, training, single=False):
     carry, tokens, action = nn.cast((carry, tokens, action))
     if single:
+      # single step
       carry, (entry, feat) = self._observe(
           carry, tokens, action, reset, training)
+      # _observe updated carry, entry, feat
       return carry, entry, feat
     else:
+      # unroll = True: check shape[1] for sequence length
       unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
+      # scan over axis 1, i.e., sequence
       carry, (entries, feat) = nj.scan(
           lambda carry, inputs: self._observe(
               carry, *inputs, training),
@@ -80,21 +84,26 @@ class RSSM(nj.Module):
       return carry, entries, feat
 
   def _observe(self, carry, tokens, action, reset, training):
-    # mask(xs, mask)
+    # zeros states if reset
     deter, stoch, action = nn.mask(
         (carry['deter'], carry['stoch'], action), ~reset)
-    # action space defined in ./embodied/envs/minecraft_flat.py
-    # .DictConcat defined in ./embodied/jax/nets.py
+    # act_space def in ./embodied/envs/minecraft_flat.py
+    # .DictConcat def in ./embodied/jax/nets.py
     action = nn.DictConcat(self.act_space, 1)(action)
     action = nn.mask(action, ~reset)
-    deter = self._core(deter, stoch, action)
+
+    deter = self._core(deter, stoch, action) # GRU updated deter
     tokens = tokens.reshape((*deter.shape[:-1], -1))
     x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
+    
+    # (, 2048) -> (, 32*32) -> (, 32, 32)
     logit = self._logit('obslogit', x)
+    # one-hot sample with straight-through gradients
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+
     carry = dict(deter=deter, stoch=stoch)
     feat = dict(deter=deter, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
@@ -142,34 +151,43 @@ class RSSM(nj.Module):
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     return carry, entries, losses, feat, metrics
 
+  # block-wise GRU update using deter, stoch, and action
   def _core(self, deter, stoch, action):
     # keep bdim and flatten stoch and classes dim
     stoch = stoch.reshape((stoch.shape[0], -1))
     # normalization due to varying scales and magnitudes
-    # sg for avoiding degenerated solutions while keeping numerical stability
+    # sg for avoiding degenerated solutions while keeping numerical stability by norm
     action /= sg(jnp.maximum(1, jnp.abs(action)))
     g = self.blocks # 8
     flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g) # (g,h)
     group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g) # (g*h)
+
     # deter/stoch/action encoded into a norm, activated hidden space (2048)
-    # check layer ops in ./embodied/jax/nets.py
+    # Linear/act/Norm def in ./embodied/jax/nets.py
     x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deter)
     x0 = nn.act(self.act)(self.sub('dynin0norm', nn.Norm, self.norm)(x0))
     x1 = self.sub('dynin1', nn.Linear, self.hidden, **self.kw)(stoch)
     x1 = nn.act(self.act)(self.sub('dynin1norm', nn.Norm, self.norm)(x1))
     x2 = self.sub('dynin2', nn.Linear, self.hidden, **self.kw)(action)
     x2 = nn.act(self.act)(self.sub('dynin2norm', nn.Norm, self.norm)(x2))
-    # (B, 2048) -> (B, 2048*3) -> (B, 1, 2048*3) -> (B, 8, 2048*3)
+    # (, 2048) -> (, 2048*3) -> (, 1, 2048*3) -> (, 8, 2048*3)
     x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
-    # (B, 4096) -> (B, 8，512); x -> (B, 8, 512+2048*3) -> (B, 8*(512+2048*3))
+    # (, 4096) -> (, 8，512); x -> (, 8, 512+2048*3) -> (, 8*(512+2048*3))
     x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
     
+    # block-wise Linear (also in nets.py)
     for i in range(self.dynlayers):
+      # each block: (, 512+2048*3) -> (, 512) then concat back to (, 4096)
       x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'dynhid{i}norm', nn.Norm, self.norm)(x))
+
+    # (, 4096/8) -> (, 4096*3/8) then concat back to (, 4096*3)
     x = self.sub('dyngru', nn.BlockLinear, 3 * self.deter, g, **self.kw)(x)
+    # (, 4096*3) -> (, 8, 4096*3/8) -> (, 8, 4096/8) * 3 gates
     gates = jnp.split(flat2group(x), 3, -1)
+    # (, 8, 4096/8) -> (, 4096)
     reset, cand, update = [group2flat(x) for x in gates]
+    # GRU updates
     reset = jax.nn.sigmoid(reset)
     cand = jnp.tanh(reset * cand)
     update = jax.nn.sigmoid(update - 1)
@@ -186,10 +204,14 @@ class RSSM(nj.Module):
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)
     x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
+    # reshape (, stoch*classes) to (, stoch, classes)
     return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
 
   def _dist(self, logits):
+    # OneHot and Agg def in ./embodied/jax/outs.py
+    # create categorical dist over logits (stoch's a dist of classes)
     out = embodied.jax.outs.OneHot(logits, self.unimix)
+    # dims = 1 then agg along -1, i.e., the last axis
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
 

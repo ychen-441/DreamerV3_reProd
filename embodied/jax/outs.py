@@ -42,7 +42,7 @@ class Agg(Output):
   def __init__(self, output, dims, agg=jnp.sum):
     self.output = output
     self.axes = [-i for i in range(1, dims + 1)]
-    self.agg = agg
+    self.agg = agg # not matter when sampling tho
 
   def __repr__(self):
     name = type(self.output).__name__
@@ -208,7 +208,10 @@ class Binary(Output):
 class Categorical(Output):
 
   def __init__(self, logits, unimix=0.0):
+    # (, 32, 32)
     logits = f32(logits)
+    # mix 99% nn output with 1% uniform
+    # avoid deterministic latents in earlier experiments (check paper)
     if unimix:
       probs = jax.nn.softmax(logits, -1)
       uniform = jnp.ones_like(probs) / probs.shape[-1]
@@ -217,13 +220,17 @@ class Categorical(Output):
     self.logits = logits
 
   def pred(self):
+    # predicted logit 
     return jnp.argmax(self.logits, -1)
 
   def sample(self, seed, shape=()):
+    # sample from -1, i.e., classes
+    # (, 32, 32) -> (,32)
     return jax.random.categorical(
         seed, self.logits, -1, shape + self.logits.shape[:-1])
 
   def logp(self, event):
+    # log prob of event
     onehot = jax.nn.one_hot(event, self.logits.shape[-1])
     return (jax.nn.log_softmax(self.logits, -1) * onehot).sum(-1)
 
@@ -263,9 +270,13 @@ class OneHot(Output):
     return self.dist.kl(other.dist)
 
   def _onehot_with_grad(self, index):
-    # Straight through gradients.
+    # straight through gradients with AD (check DreamerV2)
+    # one-hot encode sampled index w.r.t. classes, no grads
+    # (, 32) -> (, 32, 32)
     value = jax.nn.one_hot(index, self.dist.logits.shape[-1], dtype=f32)
+    # softmax prob of logits
     probs = jax.nn.softmax(self.dist.logits, -1)
+    # gradients bwd
     value = sg(value) + (probs - sg(probs))
     return value
 

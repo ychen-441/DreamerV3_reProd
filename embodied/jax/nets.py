@@ -15,13 +15,14 @@ LAYER_CALLBACK = lambda tensor, name: tensor
 f32 = jnp.float32
 
 
+# COMPUTE_TYPE converter
 def cast(xs, force=False):
   if force:
     should = lambda x: True
   else:
     # only convert floats
     should = lambda x: jnp.issubdtype(x.dtype, jnp.floating)
-    # transform to bfloat16
+  # transform to bfloat16 if force or float
   return jax.tree.map(lambda x: COMPUTE_DTYPE(x) if should(x) else x, xs)
 
 
@@ -68,6 +69,7 @@ def symexp(x):
   return jnp.sign(x) * jnp.expm1(jnp.abs(x))
 
 
+# xs if True, ys if False
 def where(condition, xs, ys):
   assert condition.dtype == bool, condition.dtype
   def fn(x, y):
@@ -79,7 +81,7 @@ def where(condition, xs, ys):
 
 
 def mask(xs, mask):
-  # either kept xs or replaced by zeros_like
+  # xs if True, zeros if False
   return where(mask, xs, jax.tree.map(jnp.zeros_like, xs))
 
 
@@ -306,7 +308,7 @@ class BlockLinear(nj.Module):
     kernel = self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
     x = x.reshape((*x.shape[:-1], self.blocks, insize // self.blocks)) # flat2group
     x = jnp.einsum('...ki,kio->...ko', x, kernel) # block-wise matmul
-    x = x.reshape((*x.shape[:-2], self.units))
+    x = x.reshape((*x.shape[:-2], self.units)) # concat
     if self.bias:
       x += self.value('bias', init(self.binit), self.units).astype(x.dtype)
     return x
@@ -392,6 +394,7 @@ class Conv3D(nj.Module):
     return x
 
 
+# RMS_norm (default) and Layer_norm
 class Norm(nj.Module):
 
   axis: tuple = (-1,)
@@ -401,45 +404,55 @@ class Norm(nj.Module):
 
   def __init__(self, impl):
     if '1em' in impl:
+      # check '1em' (m for minus?) for eps val
       impl, exp = impl.split('1em')
       self._fields['eps'] = 10 ** -int(exp)
     self.impl = impl
 
   def __call__(self, x):
     ensure_dtypes(x)
+    # save COMPUTE_TYPE and to-f32
     dtype = x.dtype
     x = f32(x)
+    # axis: tuple = (-1,), then make it [ndim-1] axis
     axis = [a % x.ndim for a in self.axis]
+    # shape = x.shape[ndim-1]
     shape = [x.shape[i] if i in axis else 1 for i in range(min(axis), x.ndim)]
     if self.impl == 'none':
       pass
     elif self.impl == 'rms':
-      mean2 = jnp.square(x).mean(axis, keepdims=True)
+      mean2 = jnp.square(x).mean(axis, keepdims=True) # mean square
+      # adc.checkpoint: recompute it during autodiff instead of caching it
+      # reduce memory usage at the cost of increased computation
       mean2 = adc.checkpoint_name(mean2, 'small')
       scale = self._scale(shape, x.dtype)
       x = x * (jax.lax.rsqrt(mean2 + self.eps) * scale)
     elif self.impl == 'layer':
-      mean = x.mean(axis, keepdims=True)
-      mean2 = jnp.square(x).mean(axis, keepdims=True)
+      mean = x.mean(axis, keepdims=True) # mean
+      mean2 = jnp.square(x).mean(axis, keepdims=True) # mean square
       mean2 = adc.checkpoint_name(mean2, 'small')
-      var = jnp.maximum(0, mean2 - jnp.square(mean))
+      var = jnp.maximum(0, mean2 - jnp.square(mean)) # variance
       var = adc.checkpoint_name(var, 'small')
+      # affine transformation
       scale = self._scale(shape, x.dtype)
       shift = self._shift(shape, x.dtype)
       x = (x - mean) * (jax.lax.rsqrt(var + self.eps) * scale) + shift
     else:
       raise NotImplementedError(self.impl)
+    # f32-to-COMPUTE_TYPE
     x = x.astype(dtype)
     return x
 
   def _scale(self, shape, dtype):
     if not self.scale:
       return jnp.ones(shape, dtype)
+    # if True init a scale factor
     return self.value('scale', jnp.ones, shape, f32).astype(dtype)
 
   def _shift(self, shape, dtype):
     if not self.shift:
       return jnp.zeros(shape, dtype)
+    # if True init a shift factor
     return self.value('shift', jnp.zeros, shape, f32).astype(dtype)
 
 
@@ -498,6 +511,7 @@ class Attention(nj.Module):
     return x
 
 
+# flattened, masked one-hot disc/squished con feature vectors
 class DictConcat:
 
   def __init__(self, spaces, fdims, squish=lambda x: x):
