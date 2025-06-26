@@ -225,7 +225,7 @@ class MinecraftBase(embodied.Env):
   @property
   def obs_space(self):
     return {
-        'image': elements.Space(np.uint8, self._size + (3,)),
+        'image': elements.Space(np.uint8, self._size + (3,)), # (64, 64, 3)
         'inventory': elements.Space(np.float32, len(self._inv_keys), 0),
         'inventory_max': elements.Space(np.float32, len(self._inv_keys), 0),
         'equipped': elements.Space(np.float32, len(self._equip_enum), 0, 1),

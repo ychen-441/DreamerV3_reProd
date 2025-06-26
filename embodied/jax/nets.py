@@ -317,29 +317,31 @@ class BlockLinear(nj.Module):
     return init(self.winit)(*args, **kwargs) * self.outscale
 
 
+# transp Conv is neither used in Encoder nor in Decoder
 class Conv2D(nj.Module):
 
   transp: bool = False
   groups: int = 1
-  pad: str = 'same'
+  pad: str = 'same' # padding
   bias: bool = True
   winit: str | Callable = Initializer('trunc_normal')
   binit: str | Callable = Initializer('zeros')
   outscale: float = 1.0
 
   def __init__(self, depth, kernel, stride=1):
-    self.depth = depth
-    self.kernel = (kernel,) * 2 if isinstance(kernel, int) else kernel
-    self.stride = stride
+    self.depth = depth # depths.shape (128, 192, 256, 256)
+    self.kernel = (kernel,) * 2 if isinstance(kernel, int) else kernel # (5, 5)
+    self.stride = stride # 2 if strided
 
   def __call__(self, x):
     ensure_dtypes(x)
+    # (5, 5, 3, 128/192/256/256) for single step img obs
     shape = (*self.kernel, x.shape[-1] // self.groups, self.depth)
+    # init kernel
     kernel = self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
+    # skip this
     if self.transp:
       assert self.pad == 'same', self.pad
-      # Manual implementation of fractionally strided convolution because the
-      # cuDNN implementation used by XLA has bugs and performance issues.
       x = x.repeat(self.stride, -2).repeat(self.stride, -3)
       maskh = ((jnp.arange(x.shape[-3]) - 1) % self.stride == 0)[:, None]
       maskw = ((jnp.arange(x.shape[-2]) - 1) % self.stride == 0)[None, :]
@@ -347,11 +349,13 @@ class Conv2D(nj.Module):
       stride = (1, 1)
     else:
       stride = (self.stride, self.stride)
+    # Conv op
     x = jax.lax.conv_general_dilated(
         x, kernel, stride, self.pad.upper(),
         feature_group_count=self.groups,
         dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
     if self.bias:
+      # init bias if necessary
       x += self.value('bias', init(self.binit), self.depth).astype(x.dtype)
     return x
 
@@ -560,7 +564,7 @@ class DictConcat:
       x = x.reshape((*x.shape[:bdims + self.fdims - 1], -1))
       ys.append(x)
     # return masked, concatenated key vectors for each batch
-    # [actions, resets] with length of sum of classes I guess for act_space
+    # [B, T, concat_F] with length of sum of classes I guess for act_space
     return jnp.concatenate(ys, -1)
 
 

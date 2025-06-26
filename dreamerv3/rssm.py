@@ -47,14 +47,13 @@ class RSSM(nj.Module):
   def initial(self, bsize):
     # zeros and transform to bfloat16
     carry = nn.cast(dict(
-        # [batch_size, D]
         deter=jnp.zeros([bsize, self.deter], f32),
         stoch=jnp.zeros([bsize, self.stoch, self.classes], f32)))
     return carry
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
-    # take only the latest step for each node
+    # take only the latest step: {[B, deter], [B, stoch, classes]}
     carry = jax.tree.map(lambda x: x[:, -1], entries)
     return carry
 
@@ -77,6 +76,7 @@ class RSSM(nj.Module):
       # unroll = True: check shape[1] for sequence length
       unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
       # scan over axis 1, i.e., sequence
+      # like an offline if sequential?
       carry, (entries, feat) = nj.scan(
           lambda carry, inputs: self._observe(
               carry, *inputs, training),
@@ -112,9 +112,11 @@ class RSSM(nj.Module):
 
   def imagine(self, carry, policy, length, training, single=False):
     if single:
+      # get policy-based actions or pre-sampled ones
+      # ???addr of policy def???
       action = policy(sg(carry)) if callable(policy) else policy
-      actemb = nn.DictConcat(self.act_space, 1)(action)
-      deter = self._core(carry['deter'], carry['stoch'], actemb)
+      actemb = nn.DictConcat(self.act_space, 1)(action) # one hot
+      deter = self._core(carry['deter'], carry['stoch'], actemb) # GRU update
       logit = self._prior(deter)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
       carry = nn.cast(dict(deter=deter, stoch=stoch))
@@ -231,9 +233,10 @@ class Encoder(nj.Module):
 
   def __init__(self, obs_space, **kw):
     assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
-    self.obs_space = obs_space
+    self.obs_space = obs_space # check ./embodied/envs/minecraft_flat.py
     self.veckeys = [k for k, s in obs_space.items() if len(s.shape) <= 2]
     self.imgkeys = [k for k, s in obs_space.items() if len(s.shape) == 3]
+    # CNN (128, 192, 256, 256)
     self.depths = tuple(self.depth * mult for mult in self.mults)
     self.kw = kw
 
@@ -248,16 +251,20 @@ class Encoder(nj.Module):
     return {}
 
   def __call__(self, carry, obs, reset, training, single=False):
-    bdims = 1 if single else 2
+    bdims = 1 if single else 2 # (B,) or (B, T)
     outs = []
     bshape = reset.shape
 
     if self.veckeys:
       vspace = {k: self.obs_space[k] for k in self.veckeys}
+      # vector obs from current input
       vecs = {k: obs[k] for k in self.veckeys}
+      # symlog squish for stability (check V3 paper)
       squish = nn.symlog if self.symlog else lambda x: x
-      x = nn.DictConcat(vspace, 1, squish=squish)(vecs)
+      x = nn.DictConcat(vspace, 1, squish=squish)(vecs) # (B, T, concat_vec)
+      # (B, T, concat_vec) -> (B*T, concat_vec)
       x = x.reshape((-1, *x.shape[bdims:]))
+      # MLP with 3 dense layers 
       for i in range(self.layers):
         x = self.sub(f'mlp{i}', nn.Linear, self.units, **self.kw)(x)
         x = nn.act(self.act)(self.sub(f'mlp{i}norm', nn.Norm, self.norm)(x))
@@ -266,8 +273,9 @@ class Encoder(nj.Module):
     if self.imgkeys:
       K = self.kernel
       imgs = [obs[k] for k in sorted(self.imgkeys)]
-      assert all(x.dtype == jnp.uint8 for x in imgs)
-      x = nn.cast(jnp.concatenate(imgs, -1), force=True) / 255 - 0.5
+      assert all(x.dtype == jnp.uint8 for x in imgs) # ensure img dtype
+      x = nn.cast(jnp.concatenate(imgs, -1), force=True) / 255 - 0.5 # norm (-0.5, 0.5)
+      # (B, T, H, W, C*imgs_num) -> (B*T, H, W, C*imgs_num)
       x = x.reshape((-1, *x.shape[bdims:]))
       for i, depth in enumerate(self.depths):
         if self.outer and i == 0:
@@ -277,15 +285,17 @@ class Encoder(nj.Module):
         else:
           x = self.sub(f'cnn{i}', nn.Conv2D, depth, K, **self.kw)(x)
           B, H, W, C = x.shape
+          # 2*2 max pooling manually
+          # H,W -> 2*2 -> max -> (B, H, W, C)
           x = x.reshape((B, H // 2, 2, W // 2, 2, C)).max((2, 4))
         x = nn.act(self.act)(self.sub(f'cnn{i}norm', nn.Norm, self.norm)(x))
       assert 3 <= x.shape[-3] <= 16, x.shape
       assert 3 <= x.shape[-2] <= 16, x.shape
-      x = x.reshape((x.shape[0], -1))
+      x = x.reshape((x.shape[0], -1)) # concat H, W, and C
       outs.append(x)
 
-    x = jnp.concatenate(outs, -1)
-    tokens = x.reshape((*bshape, *x.shape[1:]))
+    x = jnp.concatenate(outs, -1) 
+    tokens = x.reshape((*bshape, *x.shape[1:])) # (bsize, features)
     entries = {}
     return carry, entries, tokens
 
@@ -300,7 +310,7 @@ class Decoder(nj.Module):
   mults: tuple = (2, 3, 4, 4)
   layers: int = 3
   kernel: int = 5
-  symlog: bool = True
+  symlog: bool = True 
   bspace: int = 8
   outer: bool = False
   strided: bool = False
