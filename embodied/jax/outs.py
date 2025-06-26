@@ -235,6 +235,7 @@ class Categorical(Output):
     return (jax.nn.log_softmax(self.logits, -1) * onehot).sum(-1)
 
   def entropy(self):
+    # -1 for classes
     logprob = jax.nn.log_softmax(self.logits, -1)
     prob = jax.nn.softmax(self.logits, -1)
     entropy = -(prob * logprob).sum(-1)
@@ -294,12 +295,13 @@ class TwoHot(Output):
     self.unsquash = unsquash or (lambda x: x)
 
   def pred(self):
-    # The naive implementation results in a non-zero result even if the bins
-    # are symmetric and the probabilities uniform, because the sum operation
-    # goes left to right, accumulating numerical errors. Instead, we use a
-    # symmetric sum to ensure that the predicted rewards and values are
-    # actually zero at initialization.
-    # return self.unsquash((self.probs * self.bins).sum(-1))
+    # Danijar:
+    #   The naive implementation results in a non-zero result even if the bins
+    #   are symmetric and the probabilities uniform, because the sum operation
+    #   goes left to right, accumulating numerical errors. Instead, we use a
+    #   symmetric sum to ensure that the predicted rewards and values are
+    #   actually zero at initialization.
+    #   return self.unsquash((self.probs * self.bins).sum(-1))
     n = self.logits.shape[-1]
     if n % 2 == 1:
       m = (n - 1) // 2

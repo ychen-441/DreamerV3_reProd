@@ -117,8 +117,16 @@ class RSSM(nj.Module):
       action = policy(sg(carry)) if callable(policy) else policy
       actemb = nn.DictConcat(self.act_space, 1)(action) # one hot
       deter = self._core(carry['deter'], carry['stoch'], actemb) # GRU update
+      
+      # prior stoch without obs
+      # (bsize, deter) -> 
+      #     (bsize, hidden) -> 
+      #           (bsize, stoch*classes) -> 
+      #                 (bsize, stoch, classes)
       logit = self._prior(deter)
+      # one-hot sample with straight-through gradients
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+
       carry = nn.cast(dict(deter=deter, stoch=stoch))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
@@ -140,16 +148,18 @@ class RSSM(nj.Module):
 
   def loss(self, carry, tokens, acts, reset, training):
     metrics = {}
-    carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
-    prior = self._prior(feat['deter'])
-    post = feat['logit']
+    carry, entries, feat = self.observe(carry, tokens, acts, reset, training) # now with obs
+    prior = self._prior(feat['deter']) # ???last step deter -> prior???
+    post = feat['logit'] # posterior
+    # KL losses
     dyn = self._dist(sg(post)).kl(self._dist(prior))
     rep = self._dist(post).kl(self._dist(sg(prior)))
+    # freebits implementation
     if self.free_nats:
       dyn = jnp.maximum(dyn, self.free_nats)
       rep = jnp.maximum(rep, self.free_nats)
     losses = {'dyn': dyn, 'rep': rep}
-    metrics['dyn_ent'] = self._dist(prior).entropy().mean()
+    metrics['dyn_ent'] = self._dist(prior).entropy().mean() # (bsize,) -> ()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     return carry, entries, losses, feat, metrics
 
