@@ -28,11 +28,14 @@ class RSSM(nj.Module):
   obslayers: int = 1
   dynlayers: int = 1
   absolute: bool = False
+  # block-diagonal recurrent weights for param efficiency
   blocks: int = 8
   free_nats: float = 1.0 
 
   def __init__(self, act_space, **kw):
+    # **kw takes additional arguments implicitly
     assert self.deter % self.blocks == 0
+    # tasks' defs in ./embodied/envs/
     self.act_space = act_space
     self.kw = kw
 
@@ -64,6 +67,7 @@ class RSSM(nj.Module):
     return jax.tree.map(
         lambda x: x[:, -nlast:].reshape((B * nlast, *x.shape[2:])), entries)
 
+  # update carry with observations
   def observe(self, carry, tokens, action, reset, training, single=False):
     carry, tokens, action = nn.cast((carry, tokens, action))
     if single:
@@ -83,6 +87,10 @@ class RSSM(nj.Module):
           carry, (tokens, action, reset), unroll=unroll, axis=1)
       return carry, entries, feat
 
+# the main difference between obs and img is that
+#   1. img uses action given by policy(deter, stoch), then update deter
+#   2. obs updates logits (hence stoch) with (upd_deter, tokens)
+#      while img updates logits with only (upd_deter)
   def _observe(self, carry, tokens, action, reset, training):
     # zeros states if reset
     deter, stoch, action = nn.mask(
@@ -99,6 +107,7 @@ class RSSM(nj.Module):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
     
+    # a sample of disc stoch z_t with ST gradients
     # (, 2048) -> (, 32*32) -> (, 32, 32)
     logit = self._logit('obslogit', x)
     # one-hot sample with straight-through gradients
@@ -149,8 +158,11 @@ class RSSM(nj.Module):
   def loss(self, carry, tokens, acts, reset, training):
     metrics = {}
     carry, entries, feat = self.observe(carry, tokens, acts, reset, training) # now with obs
-    prior = self._prior(feat['deter']) # ???last step deter -> prior???
-    post = feat['logit'] # posterior
+    # here's the point:
+    #   feat['deter'] is updated without obs, thus prior
+    #   feat['logit'] is updated with concat deter and tokens, thus posterior
+    prior = self._prior(feat['deter'])
+    post = feat['logit']
     # KL losses
     dyn = self._dist(sg(post)).kl(self._dist(prior))
     rep = self._dist(post).kl(self._dist(sg(prior)))
@@ -159,7 +171,7 @@ class RSSM(nj.Module):
       dyn = jnp.maximum(dyn, self.free_nats)
       rep = jnp.maximum(rep, self.free_nats)
     losses = {'dyn': dyn, 'rep': rep}
-    metrics['dyn_ent'] = self._dist(prior).entropy().mean() # (bsize,) -> ()
+    metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     return carry, entries, losses, feat, metrics
 
@@ -206,6 +218,7 @@ class RSSM(nj.Module):
     deter = update * cand + (1 - update) * deter
     return deter
 
+# Check the following three in ./embodied/jax/outs.py
   def _prior(self, feat):
     x = feat
     for i in range(self.imglayers):
@@ -220,8 +233,7 @@ class RSSM(nj.Module):
     return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
 
   def _dist(self, logits):
-    # OneHot and Agg def in ./embodied/jax/outs.py
-    # create categorical dist over logits (stoch's a dist of classes)
+    # In fact a nested Agg(OneHot(Categorical(logits)))
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     # dims = 1 then agg along -1, i.e., the last axis
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)

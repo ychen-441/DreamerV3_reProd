@@ -14,9 +14,10 @@ from . import rssm
 
 f32 = jnp.float32
 i32 = jnp.int32
-# concise func def using lambda
-# e.g. def sg(xs, skip=False):..
-# stop gradient as a const
+# Danijar:
+#   concise func def using lambda
+#   e.g. def sg(xs, skip=False):..
+#   stop gradient as a const
 sg = lambda xs, skip=False: xs if skip else jax.lax.stop_gradient(xs) 
 sample = lambda xs: jax.tree.map(lambda x: x.sample(nj.seed()), xs)
 prefix = lambda xs, p: {f'{p}/{k}': v for k, v in xs.items()}
@@ -36,11 +37,17 @@ class Agent(embodied.jax.Agent):
   def __init__(self, obs_space, act_space, config):
     self.obs_space = obs_space
     self.act_space = act_space
+    # better to check how config is used in ./main.py
+    # config params check configs.yaml
     self.config = config
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
-    enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
+    enc_space = {k: v for k, v in obs_space.items() if k not in exclude} # envs
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
+    # encoder as an example:
+    #   {'simple': rssm.Encoder}['simple'] -> rssm.Encoder
+    #   **config.enc[config.enc.typ] fetch params from configs
+    #   Encoder uses enc_space and params 
     self.enc = {
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
@@ -53,13 +60,17 @@ class Agent(embodied.jax.Agent):
 
     self.feat2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
-        nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+        nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1) # (b, 4096+32*32)
 
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)
-    self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
-    self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
+    # check ./embodied/jax/heads.py
+    # .MLPHead(space, output, **hkw)
+    # where 'output' def in configs.yaml
+    self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew') # reward
+    self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con') # continue
 
+    # output for disc: categorical; for cont: bounded_normal
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
     self.pol = embodied.jax.MLPHead(

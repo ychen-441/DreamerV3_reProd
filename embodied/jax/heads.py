@@ -12,6 +12,7 @@ from . import outs
 i32 = jnp.int32
 f32 = jnp.float32
 
+# nets. refers to ./embodied/jax/nets.py
 
 class MLPHead(nj.Module):
 
@@ -25,13 +26,15 @@ class MLPHead(nj.Module):
 
   def __init__(self, space, output, **hkw):
     shared = dict(bias=self.bias, winit=self.winit, binit=self.binit)
-    mkw = dict(**shared, act=self.act, norm=self.norm)
-    hkw = dict(**shared, **hkw)
+    mkw = dict(**shared, act=self.act, norm=self.norm) # mlp_kw
+    hkw = dict(**shared, **hkw) # head_kw
+
     self.mlp = nets.MLP(self.layers, self.units, **mkw, name='mlp')
+
     if isinstance(space, dict):
-      self.head = DictHead(space, output, **hkw, name='head')
+      self.head = DictHead(space, output, **hkw, name='head') # multi-head
     else:
-      self.head = Head(space, output, **hkw, name='head')
+      self.head = Head(space, output, **hkw, name='head') # single-head
 
   def __call__(self, x, bdims):
     bshape = jax.tree.leaves(x)[0].shape[:bdims]
@@ -74,11 +77,17 @@ class Head(nj.Module):
     if isinstance(space, tuple):
       space = elements.Space(np.float32, space)
     if output == 'onehot':
+      # flatten and ensure num of classes' the same
       classes = np.asarray(space.classes).flatten()
       assert (classes == classes[0]).all(), classes
       shape = (*space.shape, classes[0].item())
       space = elements.Space(f32, shape, 0.0, 1.0)
     self.space = space
+    # e.g.:
+    #   MLPHead: **configs.~: 'output' = categorical
+    #   self.head = DictHead/Head(space, output, **hkw, name='head')
+    #   where self.impl = output -> impl = categorical 
+    #   finally output = getattr(self, self.impl)(x) -> self.categorical(x)
     self.impl = output
     self.kw = {**kw, 'outscale': self.outscale}
 

@@ -245,7 +245,7 @@ class MinecraftBase(embodied.Env):
     return {
         # .Space(dtype, shape, lower bound, upper bound)
         # .values(): [{}, {'attack:1'}, ...]
-        # tuple(): ({}, {'attack:1'}, ...) -> len() for action indices
+        # if tuple(): ({}, {'attack:1'}, ...) -> len() for action indices
         'action': elements.Space(np.int32, (), 0, len(self._action_values)),
         'reset': elements.Space(bool),
     }

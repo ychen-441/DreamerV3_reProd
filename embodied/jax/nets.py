@@ -61,6 +61,7 @@ def dropout(x, prob, training):
   return x * keep / (1.0 - prob)
 
 
+# symlog squish for varying scales and magnitudes across tasks
 def symlog(x):
   return jnp.sign(x) * jnp.log1p(jnp.abs(x))
 
@@ -285,7 +286,7 @@ class Linear(nj.Module):
     return init(self.winit)(*args, **kwargs) * self.outscale
 
 
-# block-wise linear op
+# block-wise linear op for param efficiency
 class BlockLinear(nj.Module):
 
   bias: bool = True
@@ -545,11 +546,10 @@ class DictConcat:
       # dump if greyscale or RGB image
       if space.dtype == jnp.uint8 and len(space.shape) in (2, 3):
         raise NotImplementedError('Images are not supported.')
-      # danijar/elements: space is discrete if dtype is int/bool
+      # space is discrete if dtype is int/bool
       elif space.discrete:
-        # danijar/elements: classes: num of class
         classes = np.asarray(space.classes).flatten()
-        # flatten and all to ensure the same one-hot size if multi-dim
+        # flatten and all() to ensure the same one-hot size if multi-dim
         assert (classes == classes[0]).all(), classes
         classes = classes[0].item()
         x = x.astype(jnp.int32)
@@ -646,12 +646,12 @@ class MLP(nj.Module):
   def __call__(self, x):
     shape = x.shape[:-1]
     x = x.astype(COMPUTE_DTYPE)
-    x = x.reshape([-1, x.shape[-1]])
+    x = x.reshape([-1, x.shape[-1]]) # flatten leading dims
     for i in range(self.layers):
       x = self.sub(f'linear{i}', Linear, self.units, **self.kw)(x)
       x = self.sub(f'norm{i}', Norm, self.norm)(x)
       x = act(self.act)(x)
-    x = x.reshape((*shape, x.shape[-1]))
+    x = x.reshape((*shape, x.shape[-1])) # reshape it back
     return x
 
 
