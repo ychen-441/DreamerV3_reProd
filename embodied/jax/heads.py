@@ -1,3 +1,6 @@
+# output heads for MLPs
+
+
 from typing import Callable
 
 import elements

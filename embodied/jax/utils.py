@@ -1,3 +1,8 @@
+# most descriptions of this file locate at 
+# crtic and actor learning section of DreamerV3.
+# basically target network and EMA impl, and percentile norm
+
+
 import functools
 
 import jax
@@ -13,12 +18,15 @@ i32 = jnp.int32
 COMPUTE_DTYPE = jnp.bfloat16
 
 
+# exponential moving average implementation
 class Normalize(nj.Module):
 
   rate: float = 0.01
   limit: float = 1e-8
-  perclo: float = 5.0
-  perchi: float = 95.0
+  perclo: float = 5.0 # percentile lower bound
+  perchi: float = 95.0 # percentile upper bound
+  # initializtion bias of EMA
+  # estimation not warm-up yet so bias towards zero
   debias: bool = True
 
   def __init__(self, impl):
@@ -27,7 +35,7 @@ class Normalize(nj.Module):
       self.corr = nj.Variable(jnp.zeros, (), f32, name='corr')
     if self.impl == 'none':
       pass
-    elif self.impl == 'meanstd':
+    elif self.impl == 'meanstd': # seems not used
       self.mean = nj.Variable(jnp.zeros, (), f32, name='mean')
       self.sqrs = nj.Variable(jnp.zeros, (), f32, name='sqrs')
     elif self.impl == 'perc':
@@ -49,11 +57,14 @@ class Normalize(nj.Module):
       self._update(self.mean, self._mean(x))
       self._update(self.sqrs, self._mean(jnp.square(x)))
     elif self.impl == 'perc':
-      self._update(self.lo, self._perc(x, self.perclo))
-      self._update(self.hi, self._perc(x, self.perchi))
+      self._update(self.lo, self._perc(x, self.perclo)) # 5%
+      self._update(self.hi, self._perc(x, self.perchi)) # 95%
     else:
       raise NotImplementedError(self.impl)
     if self.debias and self.impl != 'none':
+      # update corr towards 1.0
+      # then corr in stats() below scales/debiases 
+      # smoothing out outliers
       self._update(self.corr, 1.0)
 
   def stats(self):
@@ -64,33 +75,38 @@ class Normalize(nj.Module):
       return 0.0, 1.0
     elif self.impl == 'meanstd':
       mean = self.mean.read() * corr
+      # relu for filtering noise/num error-induced neg vals
       std = jnp.sqrt(jax.nn.relu(self.sqrs.read() * corr - mean ** 2))
       std = jnp.maximum(self.limit, std)
       return mean, std
     elif self.impl == 'perc':
       lo, hi = self.lo.read() * corr, self.hi.read() * corr
-      return sg(lo), sg(jnp.maximum(self.limit, hi - lo))
+      return sg(lo), sg(jnp.maximum(self.limit, hi - lo)) # lower bound and scale
     else:
       raise NotImplementedError(self.impl)
 
   def _mean(self, x):
-    x = x.mean()
+    x = x.mean() # local mean
     axes = internal.get_data_axes()
     if axes:
+      # average across devices if distributed
       x = jax.lax.pmean(x, axes)
     return x
 
   def _perc(self, x, q):
     axes = internal.get_data_axes()
     if axes:
+      # gather across devices if distributed
       x = jax.lax.all_gather(x, axes)
     x = jnp.percentile(x, q)
     return x
 
   def _update(self, var, x):
+    # only a rate of new val blended in for outlier robustness
     var.write((1 - self.rate) * var.read() + self.rate * sg(x))
 
 
+# slowly-updated target network for stability
 class SlowModel:
 
   def __init__(self, model, *, source, rate=1.0, every=1):
@@ -111,6 +127,8 @@ class SlowModel:
     return self.model(*args, **kwargs)
 
   def update(self):
+    # assign params and 
+    # blend src and model params at counter steps
     self._initonce()
     mix = jnp.where(self.count.read() % self.every == 0, self.rate, 0)
     fn = lambda src, dst: mix * src + (1 - mix) * dst
@@ -119,6 +137,7 @@ class SlowModel:
     self.count.write(self.count.read() + 1)
 
   def _initonce(self, *args, method=None, **kwargs):
+    # assign params via source model
     assert self.source.values, 'no parameters to track'
     if not self.model.values:
       p = self.model.path + '/'

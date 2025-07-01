@@ -1,3 +1,8 @@
+# def RSSM, encoder, and decoder;
+# KL loss for transition pedictor (prior)
+# and representation model (posterior).
+
+
 import math
 
 import einops

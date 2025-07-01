@@ -121,6 +121,7 @@ def get_named_axes():
 
 
 def get_data_axes():
+  # fetch axes if distributed
   axes = ('d', 'f')
   for x in axes:
     try:

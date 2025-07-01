@@ -50,13 +50,13 @@ class Agent(embodied.jax.Agent):
     #   Encoder uses enc_space and params 
     self.enc = {
         'simple': rssm.Encoder,
-    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
+    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc') # encoder
     self.dyn = {
         'rssm': rssm.RSSM,
-    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
+    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn') # sequence model
     self.dec = {
         'simple': rssm.Decoder,
-    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
+    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec') # decoder
 
     self.feat2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
@@ -67,26 +67,29 @@ class Agent(embodied.jax.Agent):
     # check ./embodied/jax/heads.py
     # .MLPHead(space, output, **hkw)
     # where 'output' def in configs.yaml
-    self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew') # reward
-    self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con') # continue
+    self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew') # reward/MLP*1
+    self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con') # continue/MLP*1
 
     # output for disc: categorical; for cont: bounded_normal
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
     self.pol = embodied.jax.MLPHead(
-        act_space, outs, **config.policy, name='pol')
-
-    self.val = embodied.jax.MLPHead(scalar, **config.value, name='val')
+        act_space, outs, **config.policy, name='pol') # actor/MLP*3
+    self.val = embodied.jax.MLPHead(scalar, **config.value, name='val') # critic/MLP*3
+    
+    # check .SlowModel and .Normalize in ./embodied/jax/utils.py
+    # slow target network for stablizing critic learning
     self.slowval = embodied.jax.SlowModel(
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
         source=self.val, **config.slowvalue)
 
-    self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
-    self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
-    self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
+    self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm') # return norm by percentile
+    self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm') # critic norm
+    self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm') # advantage norm
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    # check ./embodied/jax/opt.py
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')

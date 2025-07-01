@@ -699,6 +699,7 @@ class Transformer(nj.Module):
     return x
 
 
+# def but use a manual GRU instead in rssm.py
 class GRU(nj.Module):
 
   units: int = 1024
