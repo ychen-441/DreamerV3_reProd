@@ -347,7 +347,9 @@ class Decoder(nj.Module):
     self.obs_space = obs_space
     self.veckeys = [k for k, s in obs_space.items() if len(s.shape) <= 2]
     self.imgkeys = [k for k, s in obs_space.items() if len(s.shape) == 3]
+    # # CNN (128, 192, 256, 256)
     self.depths = tuple(self.depth * mult for mult in self.mults)
+    # channels and resolution of an image
     self.imgdep = sum(obs_space[k].shape[-1] for k in self.imgkeys)
     self.imgres = self.imgkeys and obs_space[self.imgkeys[0]].shape[:-1]
     self.kw = kw
@@ -367,8 +369,9 @@ class Decoder(nj.Module):
     K = self.kernel
     recons = {}
     bshape = reset.shape
-    inp = [nn.cast(feat[k]) for k in ('stoch', 'deter')]
-    inp = [x.reshape((math.prod(bshape), -1)) for x in inp]
+    # inp might for input
+    inp = [nn.cast(feat[k]) for k in ('stoch', 'deter')] # dtype conversion
+    inp = [x.reshape((math.prod(bshape), -1)) for x in inp] # flatten b_size
     inp = jnp.concatenate(inp, -1)
 
     if self.veckeys:
@@ -377,16 +380,19 @@ class Decoder(nj.Module):
       outputs = {k: o1 if v.discrete else o2 for k, v in spaces.items()}
       kw = dict(**self.kw, act=self.act, norm=self.norm)
       x = self.sub('mlp', nn.MLP, self.layers, self.units, **kw)(inp)
-      x = x.reshape((*bshape, *x.shape[1:]))
+      x = x.reshape((*bshape, *x.shape[1:])) # reshape
       kw = dict(**self.kw, outscale=self.outscale)
+      # check .DictHead in ./embodied/jax/heads.py
+      # -> {'space': spaces}, {'space': outputs}
       outs = self.sub('vec', embodied.jax.DictHead, spaces, outputs, **kw)(x)
       recons.update(outs)
 
     if self.imgkeys:
+      # resolution reduction
       factor = 2 ** (len(self.depths) - int(bool(self.outer)))
       minres = [int(x // factor) for x in self.imgres]
       assert 3 <= minres[0] <= 16, minres
-      assert 3 <= minres[1] <= 16, minres
+      assert 3 <= minres[1 ] <= 16, minres
       shape = (*minres, self.depths[-1])
       if self.bspace:
         u, g = math.prod(shape), self.bspace
@@ -405,6 +411,8 @@ class Decoder(nj.Module):
       else:
         x = self.sub('space', nn.Linear, shape, **kw)(inp)
         x = nn.act(self.act)(self.sub('spacenorm', nn.Norm, self.norm)(x))
+
+        
       for i, depth in reversed(list(enumerate(self.depths[:-1]))):
         if self.strided:
           kw = dict(**self.kw, transp=True)

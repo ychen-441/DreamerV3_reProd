@@ -95,12 +95,15 @@ class Agent(embodied.jax.Agent):
         name='opt')
 
     scales = self.config.loss_scales.copy()
+    # ???rec might for reconstruction???
     rec = scales.pop('rec')
+    # add obs key-val pairs with val=rec
     scales.update({k: rec for k in dec_space})
     self.scales = scales
 
   @property
   def policy_keys(self):
+    # matching with enc/, dyn/, dec/, and pol/
     return '^(enc|dyn|dec|pol)/'
 
   @property
@@ -109,6 +112,7 @@ class Agent(embodied.jax.Agent):
     spaces['consec'] = elements.Space(np.int32)
     spaces['stepid'] = elements.Space(np.uint8, 20)
     if self.config.replay_context:
+      # append single-level dicts of enc, dyn, and dyn
       spaces.update(elements.tree.flatdict(dict(
           enc=self.enc.entry_space,
           dyn=self.dyn.entry_space,
@@ -117,6 +121,7 @@ class Agent(embodied.jax.Agent):
 
   def init_policy(self, batch_size):
     zeros = lambda x: jnp.zeros((batch_size, *x.shape), x.dtype)
+    # zeros as (batch_size, ~) with different dtypes
     return (
         self.enc.initial(batch_size),
         self.dyn.initial(batch_size),
@@ -129,9 +134,11 @@ class Agent(embodied.jax.Agent):
   def init_report(self, batch_size):
     return self.init_policy(batch_size)
 
+  # check rssm.py if you get confused about any terms
   def policy(self, carry, obs, mode='train'):
+    # ???{deter=deter, stoch=stoch}???
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
-    kw = dict(training=False, single=True)
+    kw = dict(training=False, single=True) # single step
     reset = obs['is_first']
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
     dyn_carry, dyn_entry, feat = self.dyn.observe(

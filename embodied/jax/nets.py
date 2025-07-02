@@ -139,6 +139,7 @@ def ensure_dtypes_bwd(fwd, bwd, cache, dx):
 ensure_dtypes.defvjp(ensure_dtypes_fwd, ensure_dtypes_bwd)
 
 
+# root mean square of nodes
 def rms(xs):
   xs = jax.tree.leaves(xs)
   count = sum(x.size for x in xs)
@@ -400,6 +401,7 @@ class Conv3D(nj.Module):
 
 
 # RMS_norm (default) and Layer_norm
+# scale and shift for flexible and effective learning
 class Norm(nj.Module):
 
   axis: tuple = (-1,)

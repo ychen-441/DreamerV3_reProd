@@ -1,4 +1,9 @@
 # output heads for MLPs
+# e.g.:
+#   MLPHead: **configs.~: 'output' = categorical
+#   self.head = DictHead/Head(space, output, **hkw, name='head')
+#   where self.impl = output -> impl = categorical 
+#   finally output = getattr(self, self.impl)(x) -> self.categorical(x)
 
 
 from typing import Callable
@@ -86,11 +91,6 @@ class Head(nj.Module):
       shape = (*space.shape, classes[0].item())
       space = elements.Space(f32, shape, 0.0, 1.0)
     self.space = space
-    # e.g.:
-    #   MLPHead: **configs.~: 'output' = categorical
-    #   self.head = DictHead/Head(space, output, **hkw, name='head')
-    #   where self.impl = output -> impl = categorical 
-    #   finally output = getattr(self, self.impl)(x) -> self.categorical(x)
     self.impl = output
     self.kw = {**kw, 'outscale': self.outscale}
 
@@ -100,7 +100,7 @@ class Head(nj.Module):
     x = nets.ensure_dtypes(x)
     output = getattr(self, self.impl)(x)
     if self.space.shape:
-      output = outs.Agg(output, len(self.space.shape), jnp.sum)
+      output = outs.Agg(output, len(self.space.shape), jnp.sum) # match space shape
     assert output.pred().shape[x.ndim - 1:] == self.space.shape, (
         self.space, self.impl, x.shape, output.pred().shape)
     return output

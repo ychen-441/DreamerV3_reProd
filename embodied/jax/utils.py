@@ -127,10 +127,13 @@ class SlowModel:
     return self.model(*args, **kwargs)
 
   def update(self):
-    # assign params and 
-    # blend src and model params at counter steps
+    # assign params
     self._initonce()
+    # blend src and model params at counter steps
     mix = jnp.where(self.count.read() % self.every == 0, self.rate, 0)
+    # dst might for destination as a target
+    # since a target network do: 
+    #   target <- rate*online + (1-rate)*target
     fn = lambda src, dst: mix * src + (1 - mix) * dst
     values = jax.tree.map(fn, self.source.values, self.model.values)
     [self.model.write(k, v) for k, v in values.items()]
