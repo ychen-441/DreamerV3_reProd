@@ -355,7 +355,7 @@ class Conv2D(nj.Module):
     x = jax.lax.conv_general_dilated(
         x, kernel, stride, self.pad.upper(),
         feature_group_count=self.groups,
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC')) # (inp, kernel, outp)
     if self.bias:
       # init bias if necessary
       x += self.value('bias', init(self.binit), self.depth).astype(x.dtype)

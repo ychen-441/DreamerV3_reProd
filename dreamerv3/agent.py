@@ -70,6 +70,7 @@ class Agent(embodied.jax.Agent):
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew') # reward/MLP*1
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con') # continue/MLP*1
 
+    # KEY Actor-Critic part init
     # output for disc: categorical; for cont: bounded_normal
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -95,7 +96,7 @@ class Agent(embodied.jax.Agent):
         name='opt')
 
     scales = self.config.loss_scales.copy()
-    # ???rec might for reconstruction???
+    # 'rec' for reconstruction
     rec = scales.pop('rec')
     # add obs key-val pairs with val=rec
     scales.update({k: rec for k in dec_space})
@@ -121,7 +122,7 @@ class Agent(embodied.jax.Agent):
 
   def init_policy(self, batch_size):
     zeros = lambda x: jnp.zeros((batch_size, *x.shape), x.dtype)
-    # zeros as (batch_size, ~) with different dtypes
+    # return zero carries with 'deter' and 'stoch', and act_space
     return (
         self.enc.initial(batch_size),
         self.dyn.initial(batch_size),
@@ -136,24 +137,30 @@ class Agent(embodied.jax.Agent):
 
   # check rssm.py if you get confused about any terms
   def policy(self, carry, obs, mode='train'):
-    # ???{deter=deter, stoch=stoch}???
+    # {'deter', 'stoch'}
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
     kw = dict(training=False, single=True) # single step
-    reset = obs['is_first']
+    reset = obs['is_first'] # .Space(bool)
+    # encoding
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
+    # dynamics prediction
     dyn_carry, dyn_entry, feat = self.dyn.observe(
         dyn_carry, tokens, prevact, reset, **kw)
     dec_entry = {}
     if dec_carry:
+      # decoding
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
+    # pol: MLPHead(x, bdims) (check ./embodied/jax/heads.py)
     policy = self.pol(self.feat2tensor(feat), bdims=1)
-    act = sample(policy)
+    act = sample(policy) # actions sampled from policy
     out = {}
+    # check invalid elements
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
-    carry = (enc_carry, dyn_carry, dec_carry, act)
+    carry = (enc_carry, dyn_carry, dec_carry, act) # carry update
     if self.config.replay_context:
+     # add entries to replay buffer
       out.update(elements.tree.flatdict(dict(
           enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
     return carry, act, out
@@ -172,8 +179,9 @@ class Agent(embodied.jax.Agent):
       assert all(x.shape[:2] == (B, T) for x in updates.values()), (
           (B, T), {k: v.shape for k, v in updates.items()})
       outs['replay'] = updates
-    # if self.config.replay.fracs.priority > 0:
-    #   outs['replay']['priority'] = losses['model']
+    # Danijar:
+    #   if self.config.replay.fracs.priority > 0:
+    #     outs['replay']['priority'] = losses['model']
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 

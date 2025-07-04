@@ -388,24 +388,31 @@ class Decoder(nj.Module):
       recons.update(outs)
 
     if self.imgkeys:
-      # resolution reduction
+      # initial minres
       factor = 2 ** (len(self.depths) - int(bool(self.outer)))
       minres = [int(x // factor) for x in self.imgres]
       assert 3 <= minres[0] <= 16, minres
       assert 3 <= minres[1 ] <= 16, minres
+       # (4, 4, 256), start with minres with deepest channel
       shape = (*minres, self.depths[-1])
+      # blockwise linear ops with 8 blocks
       if self.bspace:
+        # u = 4*4*256, g = 8
         u, g = math.prod(shape), self.bspace
         x0, x1 = nn.cast((feat['deter'], feat['stoch']))
-        x1 = x1.reshape((*x1.shape[:-2], -1))
+        x1 = x1.reshape((*x1.shape[:-2], -1)) # flatten (, 32, 32)
         x0 = x0.reshape((-1, x0.shape[-1]))
         x1 = x1.reshape((-1, x1.shape[-1]))
+        # x0.shape: (4096)
         x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)
+        #       -> (4, 4, 256)
         x0 = einops.rearrange(
             x0, '... (g h w c) -> ... h w (g c)',
             h=minres[0], w=minres[1], g=g)
+        # x1.shape: (1024) -> (2048)
         x1 = self.sub('sp1', nn.Linear, 2 * self.units, **self.kw)(x1)
         x1 = nn.act(self.act)(self.sub('sp1norm', nn.Norm, self.norm)(x1))
+        #       -> (4, 4, 256)
         x1 = self.sub('sp2', nn.Linear, shape, **self.kw)(x1)
         x = nn.act(self.act)(self.sub('spnorm', nn.Norm, self.norm)(x0 + x1))
       else:
@@ -413,11 +420,14 @@ class Decoder(nj.Module):
         x = nn.act(self.act)(self.sub('spacenorm', nn.Norm, self.norm)(x))
 
         
-      for i, depth in reversed(list(enumerate(self.depths[:-1]))):
+      for i, depth in reversed(list(enumerate(self.depths[:-1]))): # 256->192->128
         if self.strided:
           kw = dict(**self.kw, transp=True)
           x = self.sub(f'conv{i}', nn.Conv2D, depth, K, 2, **kw)(x)
         else:
+          # (8, 8, 256) ->
+          #       (16, 16, 192) ->
+          #             (32, 32, 128)
           x = x.repeat(2, -2).repeat(2, -3)
           x = self.sub(f'conv{i}', nn.Conv2D, depth, K, **self.kw)(x)
         x = nn.act(self.act)(self.sub(f'conv{i}norm', nn.Norm, self.norm)(x))
@@ -428,11 +438,14 @@ class Decoder(nj.Module):
         kw = dict(**self.kw, outscale=self.outscale, transp=True)
         x = self.sub('imgout', nn.Conv2D, self.imgdep, K, 2, **kw)(x)
       else:
+        # (32, 32,) -> (64, 64,)
         x = x.repeat(2, -2).repeat(2, -3)
         kw = dict(**self.kw, outscale=self.outscale)
+        # (64, 64, imgdep)
         x = self.sub('imgout', nn.Conv2D, self.imgdep, K, **kw)(x)
-      x = jax.nn.sigmoid(x)
-      x = x.reshape((*bshape, *x.shape[1:]))
+      x = jax.nn.sigmoid(x) # pixel val norm
+      x = x.reshape((*bshape, *x.shape[1:])) # reshape bsize
+      # split channels for each imgkey
       split = np.cumsum(
           [self.obs_space[k].shape[-1] for k in self.imgkeys][:-1])
       for k, out in zip(self.imgkeys, jnp.split(x, split, -1)):
