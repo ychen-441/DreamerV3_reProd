@@ -113,7 +113,7 @@ class Agent(embodied.jax.Agent):
     spaces['consec'] = elements.Space(np.int32)
     spaces['stepid'] = elements.Space(np.uint8, 20)
     if self.config.replay_context:
-      # append single-level dicts of enc, dyn, and dyn
+      # single-level dict with something like 'enc/deter', 'dyn/stoch', etc.
       spaces.update(elements.tree.flatdict(dict(
           enc=self.enc.entry_space,
           dyn=self.dyn.entry_space,
@@ -166,22 +166,28 @@ class Agent(embodied.jax.Agent):
     return carry, act, out
 
   def train(self, carry, data):
+    # lhs for carry, rhs for obs, act, stepid
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
+    # opt returns metrics, aux
     metrics, (carry, entries, outs, mets) = self.opt(
         self.loss, carry, obs, prevact, training=True, has_aux=True)
     metrics.update(mets)
-    self.slowval.update()
+    self.slowval.update() # target update
     outs = {}
     if self.config.replay_context:
       updates = elements.tree.flatdict(dict(
           stepid=stepid, enc=entries[0], dyn=entries[1], dec=entries[2]))
       B, T = obs['is_first'].shape
+      # check if bsize the same for all items in updates
       assert all(x.shape[:2] == (B, T) for x in updates.values()), (
           (B, T), {k: v.shape for k, v in updates.items()})
       outs['replay'] = updates
+    
     # Danijar:
     #   if self.config.replay.fracs.priority > 0:
     #     outs['replay']['priority'] = losses['model']
+
+    # add the latest actions of each key from act_space
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 
@@ -197,54 +203,62 @@ class Agent(embodied.jax.Agent):
         enc_carry, obs, reset, training)
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
         dyn_carry, tokens, prevact, reset, training)
+    # los: dyn, rep KL loss; met: dyn, rep entropy
     losses.update(los)
     metrics.update(mets)
     dec_carry, dec_entries, recons = self.dec(
         dec_carry, repfeat, reset, training)
+
     inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
-    losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
+    # ~/heads.py MLPHead -> ~/outs.py .loss(~)
+    # MLPHead(): 'rew'/'con' -> 
+    #       .loss(): symexp_twohot(obs['reward'])/binary(con)
+    losses['rew'] = self.rew(inp, 2).loss(obs['reward']) # reward loss
     con = f32(~obs['is_terminal'])
+    # contdisc for discount(con) factor flag
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
-    losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
+    losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con) # continue loss
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
       target = f32(value) / 255 if isimage(space) else value
-      losses[key] = recon.loss(sg(target))
+      losses[key] = recon.loss(sg(target)) # reconstruction loss
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
 
     # Imagination
-    K = min(self.config.imag_last or T, T)
-    H = self.config.imag_length
-    starts = self.dyn.starts(dyn_entries, dyn_carry, K)
-    policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
+    K = min(self.config.imag_last or T, T) # 0 then K = T, imag_seq_length
+    H = self.config.imag_length # 15, imag_horizon
+    starts = self.dyn.starts(dyn_entries, dyn_carry, K) # extract K latest steps
+    policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1)) # sample act from pol
     _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
     first = jax.tree.map(
         lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
+    # concat previous (first) and imag feat
     imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
-    lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat))
+    lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat)) # act based on the latest imag_feat
     lastact = jax.tree.map(lambda x: x[:, None], lastact)
+    # concat previous and imag act
     imgact = concat([imgprevact, lastact], 1)
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
     los, imgloss_out, mets = imag_loss(
-        imgact,
-        self.rew(inp, 2).pred(),
-        self.con(inp, 2).prob(1),
-        self.pol(inp, 2),
-        self.val(inp, 2),
-        self.slowval(inp, 2),
-        self.retnorm, self.valnorm, self.advnorm,
+        imgact, # imag_act
+        self.rew(inp, 2).pred(), # pred_rew
+        self.con(inp, 2).prob(1), # prob of con or terminated
+        self.pol(inp, 2), # policy/actor
+        self.val(inp, 2), # critic
+        self.slowval(inp, 2), # critic target
+        self.retnorm, self.valnorm, self.advnorm, # return,value, advantage norm
         update=training,
         contdisc=self.config.contdisc,
-        horizon=self.config.horizon,
+        horizon=self.config.horizon, # 333, more like seq_length
         **self.config.imag_loss)
-    losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
+    losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()}) # add actor, critic losses
     metrics.update(mets)
 
     # Replay
@@ -341,22 +355,31 @@ class Agent(embodied.jax.Agent):
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, metrics
 
+# slice lhs and rhs for context and training, respectively
   def _apply_replay_context(self, carry, data):
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
     carry = (enc_carry, dyn_carry, dec_carry)
     stepid = data['stepid']
     obs = {k: data[k] for k in self.obs_space}
+    # previous 1-step action prepend to (T-1) act sequence
     prepend = lambda x, y: jnp.concatenate([x[:, None], y[:, :-1]], 1)
     prevact = {k: prepend(prevact[k], data[k]) for k in self.act_space}
     if not self.config.replay_context:
       return carry, obs, prevact, stepid
 
     K = self.config.replay_context
+    # nested dict turns, e.g., 
+    # 'enc/deter', 'dyn/stoch' to 'enc':{~}, 'dyn':{~}, etc.
     nested = elements.tree.nestdict(data)
+    # keys extracted from nested data
+    # entries[0/1/2] = 'enc'/'dyn'/'dec'
     entries = [nested.get(k, {}) for k in ('enc', 'dyn', 'dec')]
-    lhs = lambda xs: jax.tree.map(lambda x: x[:, :K], xs)
-    rhs = lambda xs: jax.tree.map(lambda x: x[:, K:], xs)
+
+    # replay context using lhs, rhs for training
+    lhs = lambda xs: jax.tree.map(lambda x: x[:, :K], xs) # [0]
+    rhs = lambda xs: jax.tree.map(lambda x: x[:, K:], xs) # [1:-1]
     rep_carry = (
+        # truncate() fetch the latest entry and return as carry
         self.enc.truncate(lhs(entries[0]), enc_carry),
         self.dyn.truncate(lhs(entries[1]), dyn_carry),
         self.dec.truncate(lhs(entries[2]), dec_carry))
@@ -364,7 +387,10 @@ class Agent(embodied.jax.Agent):
     rep_prevact = {k: data[k][:, K - 1: -1] for k in self.act_space}
     rep_stepid = rhs(stepid)
 
+    # check if it is a start of a new chunk
     first_chunk = (data['consec'][:, 0] == 0)
+    # check .where in ~/nets.py
+    # replay if first_chunk, otherwise normal
     carry, obs, prevact, stepid = jax.tree.map(
         lambda normal, replay: nn.where(first_chunk, replay, normal),
         (carry, rhs(obs), rhs(prevact), rhs(stepid)),
@@ -411,6 +437,7 @@ class Agent(embodied.jax.Agent):
     return optax.chain(*chain)
 
 
+# losses, raw lambda returns, and metrics
 def imag_loss(
     act, rew, con,
     policy, value, slowvalue,
@@ -426,34 +453,39 @@ def imag_loss(
   losses = {}
   metrics = {}
 
-  voffset, vscale = valnorm.stats()
+  voffset, vscale = valnorm.stats() # 'none', so 0, 1; check ~/utils.py
   val = value.pred() * vscale + voffset
   slowval = slowvalue.pred() * vscale + voffset
   tarval = slowval if slowtar else val
-  disc = 1 if contdisc else 1 - 1 / horizon
+  disc = 1 if contdisc else 1 - 1 / horizon # discount factor
   weight = jnp.cumprod(disc * con, 1) / disc
   last = jnp.zeros_like(con)
-  term = 1 - con
+  term = 1 - con # terminal
+  # lambda return 
   ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
 
-  roffset, rscale = retnorm(ret, update)
-  adv = (ret - tarval[:, :-1]) / rscale
-  aoffset, ascale = advnorm(adv, update)
-  adv_normed = (adv - aoffset) / ascale
+  roffset, rscale = retnorm(ret, update) # 'perc'
+  adv = (ret - tarval[:, :-1]) / rscale # calculate advantage, then norm
+  aoffset, ascale = advnorm(adv, update) # 'none', so 0, 1
+  adv_normed = (adv - aoffset) / ascale # then norm
+
+  # log prob of pol-pred acts, and entropy of pol
   logpi = sum([v.logp(sg(act[k]))[:, :-1] for k, v in policy.items()])
   ents = {k: v.entropy()[:, :-1] for k, v in policy.items()}
   policy_loss = sg(weight[:, :-1]) * -(
       logpi * sg(adv_normed) + actent * sum(ents.values()))
-  losses['policy'] = policy_loss
+  losses['policy'] = policy_loss # actor/policy loss
 
-  voffset, vscale = valnorm(ret, update)
-  tar_normed = (ret - voffset) / vscale
+  voffset, vscale = valnorm(ret, update) # 'none', so 0, 1
+  tar_normed = (ret - voffset) / vscale # then norm
   tar_padded = jnp.concatenate([tar_normed, 0 * tar_normed[:, -1:]], 1)
+  # critic/value loss w.r.t. both ret-based val pred and slow target val
   losses['value'] = sg(weight[:, :-1]) * (
       value.loss(sg(tar_padded)) +
       slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
 
-  ret_normed = (ret - roffset) / rscale
+  ret_normed = (ret - roffset) / rscale # norm
+
   metrics['adv'] = adv.mean()
   metrics['adv_std'] = adv.std()
   metrics['adv_mag'] = jnp.abs(adv).mean()
@@ -478,6 +510,8 @@ def imag_loss(
   return losses, outs, metrics
 
 
+# details refer to imag_loss 
+# which holds sort of the same workflow
 def repl_loss(
     last, term, rew, boot,
     value, slowvalue, valnorm,
@@ -489,6 +523,7 @@ def repl_loss(
 ):
   losses = {}
 
+  # norm
   voffset, vscale = valnorm.stats()
   val = value.pred() * vscale + voffset
   slowval = slowvalue.pred() * vscale + voffset
@@ -511,12 +546,22 @@ def repl_loss(
   return losses, outs, metrics
 
 
+# lambda return for value estimation
 def lambda_return(last, term, rew, val, boot, disc, lam):
+  # boot for bootstraps
   chex.assert_equal_shape((last, term, rew, val, boot))
   rets = [boot[:, -1]]
-  live = (1 - f32(term))[:, 1:] * disc
-  cont = (1 - f32(last))[:, 1:] * lam
+  # term = 1 - con
+  # last = 0
+  live = (1 - f32(term))[:, 1:] * disc # ≡ con * disc
+  cont = (1 - f32(last))[:, 1:] * lam # ≡ lam
+  # intermediate return = 
+  #       immediate reward rew[:, 1:] + 
+  #             discounted bootstrapped value live * boot[:, 1:] 
+  # weighted by discount factor (1-cont)
   interm = rew[:, 1:] + (1 - cont) * live * boot[:, 1:]
+  # reverse recursion to build lambda return
   for t in reversed(range(live.shape[1])):
     rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
+  # # and reverse it back to see lambda ret along the trajectory
   return jnp.stack(list(reversed(rets))[:-1], 1)

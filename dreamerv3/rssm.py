@@ -61,7 +61,7 @@ class RSSM(nj.Module):
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
-    # take only the latest step: {[B, deter], [B, stoch, classes]}
+    # take only the latest step, [:, -1, :]
     carry = jax.tree.map(lambda x: x[:, -1], entries)
     return carry
 
