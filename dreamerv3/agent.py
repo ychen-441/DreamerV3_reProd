@@ -166,9 +166,10 @@ class Agent(embodied.jax.Agent):
     return carry, act, out
 
   def train(self, carry, data):
-    # lhs for carry, rhs for obs, act, stepid
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
-    # opt returns metrics, aux
+    # opt using lossfn below 
+    # return loss, (carry, entries, outs, metrics) as outs in ~/opt.py
+    # then outs -> loss, aux -> (metrics, aux)
     metrics, (carry, entries, outs, mets) = self.opt(
         self.loss, carry, obs, prevact, training=True, has_aux=True)
     metrics.update(mets)
@@ -181,7 +182,7 @@ class Agent(embodied.jax.Agent):
       # check if bsize the same for all items in updates
       assert all(x.shape[:2] == (B, T) for x in updates.values()), (
           (B, T), {k: v.shape for k, v in updates.items()})
-      outs['replay'] = updates
+      outs['replay'] = updates # ???context???
     
     # Danijar:
     #   if self.config.replay.fracs.priority > 0:
@@ -193,7 +194,7 @@ class Agent(embodied.jax.Agent):
 
   def loss(self, carry, obs, prevact, training):
     enc_carry, dyn_carry, dec_carry = carry
-    reset = obs['is_first']
+    reset = obs['is_first'] # store B, T shape
     B, T = reset.shape
     losses = {}
     metrics = {}
@@ -201,9 +202,9 @@ class Agent(embodied.jax.Agent):
     # World model
     enc_carry, enc_entries, tokens = self.enc(
         enc_carry, obs, reset, training)
+    # los: dyn, rep KL loss; met: dyn, rep entropy
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
         dyn_carry, tokens, prevact, reset, training)
-    # los: dyn, rep KL loss; met: dyn, rep entropy
     losses.update(los)
     metrics.update(mets)
     dec_carry, dec_entries, recons = self.dec(
@@ -230,19 +231,22 @@ class Agent(embodied.jax.Agent):
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
 
     # Imagination
-    K = min(self.config.imag_last or T, T) # 0 then K = T, imag_seq_length
+    # feels like K step warm up
+    K = min(self.config.imag_last or T, T) # 0 then K = T
     H = self.config.imag_length # 15, imag_horizon
     starts = self.dyn.starts(dyn_entries, dyn_carry, K) # extract K latest steps
     policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1)) # sample act from pol
     _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
     first = jax.tree.map(
-        lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
+        lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat) # feat: (B*K, 1,)
     # concat previous (first) and imag feat
-    imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
-    lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat)) # act based on the latest imag_feat
-    lastact = jax.tree.map(lambda x: x[:, None], lastact)
+    imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1) # feat: (B*K, H+1,)
+    # action based on the latest imag_fat
+    lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat)) # act: (B*K,)
+    # add a T axis to match imgprevact
+    lastact = jax.tree.map(lambda x: x[:, None], lastact) # act: (B*K, 1,)
     # concat previous and imag act
-    imgact = concat([imgprevact, lastact], 1)
+    imgact = concat([imgprevact, lastact], 1) # concat: (B*K, H+1,)
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
@@ -256,15 +260,19 @@ class Agent(embodied.jax.Agent):
         self.retnorm, self.valnorm, self.advnorm, # return,value, advantage norm
         update=training,
         contdisc=self.config.contdisc,
-        horizon=self.config.horizon, # 333, more like seq_length
+        horizon=self.config.horizon, # 333, discount horizon
         **self.config.imag_loss)
-    losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()}) # add actor, critic losses
+    # update actor, imag critic loss
+    losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
 
+    # an additional replay buffer critic loss
+    # for envs where the rew is hard to predict
     # Replay
     if self.config.repval_loss:
       feat = sg(repfeat, skip=self.config.repval_grad)
       last, term, rew = [obs[k] for k in ('is_last', 'is_terminal', 'reward')]
+      # lambda return at the start of imag traj
       boot = imgloss_out['ret'][:, 0].reshape(B, K)
       feat, last, term, rew, boot = jax.tree.map(
           lambda x: x[:, -K:], (feat, last, term, rew, boot))
@@ -277,12 +285,13 @@ class Agent(embodied.jax.Agent):
           update=training,
           horizon=self.config.horizon,
           **self.config.repl_loss)
-      losses.update(los)
+      losses.update(los) # update replay buffer critic loss
       metrics.update(prefix(mets, 'reploss'))
 
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
+    # scale as beta; 0.1 for val and 0.3 for repval
     loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
 
     carry = (enc_carry, dyn_carry, dec_carry)
@@ -297,10 +306,11 @@ class Agent(embodied.jax.Agent):
     carry, obs, prevact, _ = self._apply_replay_context(carry, data)
     (enc_carry, dyn_carry, dec_carry) = carry
     B, T = obs['is_first'].shape
-    RB = min(6, B)
+    RB = min(6, B) # reduced batch size
     metrics = {}
 
     # Train metrics
+    # update = False -> ret/adv/val norm without update; check ~/utils.py
     _, (new_carry, entries, outs, mets) = self.loss(
         carry, obs, prevact, training=False)
     mets.update(mets)
@@ -309,25 +319,33 @@ class Agent(embodied.jax.Agent):
     if self.config.report_gradnorms:
       for key in self.scales:
         try:
+          # outs['losses'][key].mean()
           lossfn = lambda data, carry: self.loss(
               carry, obs, prevact, training=False)[1][2]['losses'][key].mean()
+          # nj.grad() return loss, params, grads
+          # [-1] gives grads only, which is grad of lossfn w.r.t. modules
           grad = nj.grad(lossfn, self.modules)(data, carry)[-1]
           metrics[f'gradnorm/{key}'] = optax.global_norm(grad)
         except KeyError:
           print(f'Skipping gradnorm summary for missing loss: {key}')
 
     # Open loop
+    # truncate
     firsthalf = lambda xs: jax.tree.map(lambda x: x[:RB, :T // 2], xs)
     secondhalf = lambda xs: jax.tree.map(lambda x: x[:RB, T // 2:], xs)
     dyn_carry = jax.tree.map(lambda x: x[:RB], dyn_carry)
     dec_carry = jax.tree.map(lambda x: x[:RB], dec_carry)
+    # dyn using first half
     dyn_carry, _, obsfeat = self.dyn.observe(
         dyn_carry, firsthalf(outs['tokens']), firsthalf(prevact),
-        firsthalf(obs['is_first']), training=False)
+        firsthalf(obs['is_first']), training=False) # zeros if isfirst
+    # imag using upd dyn and second half actions
     _, imgfeat, _ = self.dyn.imagine(
         dyn_carry, secondhalf(prevact), length=T - T // 2, training=False)
+    # recon first half obs, recon good enough or not
     dec_carry, _, obsrecons = self.dec(
         dec_carry, obsfeat, firsthalf(obs['is_first']), training=False)
+    # recon imag feat, dyn good enough or not
     dec_carry, _, imgrecons = self.dec(
         dec_carry, imgfeat, jnp.zeros_like(secondhalf(obs['is_first'])),
         training=False)
@@ -336,26 +354,31 @@ class Agent(embodied.jax.Agent):
     for key in self.dec.imgkeys:
       assert obs[key].dtype == jnp.uint8
       true = obs[key][:RB]
+
       pred = jnp.concatenate([obsrecons[key].pred(), imgrecons[key].pred()], 1)
+      # convert [0, 1] back to [0, 255]
       pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
       error = ((i32(pred) - i32(true) + 255) / 2).astype(np.uint8)
       video = jnp.concatenate([true, pred, error], 2)
 
+      # padding on H and W for borders
       video = jnp.pad(video, [[0, 0], [0, 0], [2, 2], [2, 2], [0, 0]])
-      mask = jnp.zeros(video.shape, bool).at[:, :, 2:-2, 2:-2, :].set(True)
-      border = jnp.full((T, 3), jnp.array([0, 255, 0]), jnp.uint8)
-      border = border.at[T // 2:].set(jnp.array([255, 0, 0], jnp.uint8))
+      mask = jnp.zeros(video.shape, bool).at[:, :, 2:-2, 2:-2, :].set(True) # false the pads 
+      border = jnp.full((T, 3), jnp.array([0, 255, 0]), jnp.uint8) # green for obs
+      border = border.at[T // 2:].set(jnp.array([255, 0, 0], jnp.uint8)) # red for imag
       video = jnp.where(mask, video, border[None, :, None, None, :])
-      video = jnp.concatenate([video, 0 * video[:, :10]], 1)
+      video = jnp.concatenate([video, 0 * video[:, :10]], 1) # 10 black frames
 
       B, T, H, W, C = video.shape
       grid = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
       metrics[f'openloop/{key}'] = grid
 
-    carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
+    carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space}) # latest action
     return carry, metrics
 
-# slice lhs and rhs for context and training, respectively
+  # carry if is not a new chunk
+  # then prevact shifts backwards to get the latest act to this chunk
+  # otherwise, use context to warm up and full seq of act 
   def _apply_replay_context(self, carry, data):
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
     carry = (enc_carry, dyn_carry, dec_carry)
@@ -367,7 +390,7 @@ class Agent(embodied.jax.Agent):
     if not self.config.replay_context:
       return carry, obs, prevact, stepid
 
-    K = self.config.replay_context
+    K = self.config.replay_context # 1 by default
     # nested dict turns, e.g., 
     # 'enc/deter', 'dyn/stoch' to 'enc':{~}, 'dyn':{~}, etc.
     nested = elements.tree.nestdict(data)
@@ -377,7 +400,7 @@ class Agent(embodied.jax.Agent):
 
     # replay context using lhs, rhs for training
     lhs = lambda xs: jax.tree.map(lambda x: x[:, :K], xs) # [0]
-    rhs = lambda xs: jax.tree.map(lambda x: x[:, K:], xs) # [1:-1]
+    rhs = lambda xs: jax.tree.map(lambda x: x[:, K:], xs) # [1:]
     rep_carry = (
         # truncate() fetch the latest entry and return as carry
         self.enc.truncate(lhs(entries[0]), enc_carry),
@@ -389,12 +412,11 @@ class Agent(embodied.jax.Agent):
 
     # check if it is a start of a new chunk
     first_chunk = (data['consec'][:, 0] == 0)
-    # check .where in ~/nets.py
     # replay if first_chunk, otherwise normal
     carry, obs, prevact, stepid = jax.tree.map(
         lambda normal, replay: nn.where(first_chunk, replay, normal),
-        (carry, rhs(obs), rhs(prevact), rhs(stepid)),
-        (rep_carry, rep_obs, rep_prevact, rep_stepid))
+        (carry, rhs(obs), rhs(prevact), rhs(stepid)), # normal
+        (rep_carry, rep_obs, rep_prevact, rep_stepid)) # replay
     return carry, obs, prevact, stepid
 
   def _make_opt(
@@ -413,31 +435,37 @@ class Agent(embodied.jax.Agent):
       anneal: int = 0,
   ):
     chain = []
+    # a series of grad transformation def in ~/opt.py
     chain.append(embodied.jax.opt.clip_by_agc(agc))
     chain.append(embodied.jax.opt.scale_by_rms(beta2, eps))
     chain.append(embodied.jax.opt.scale_by_momentum(beta1, nesterov))
-    if wd:
+    if wd: # weight decay
       assert not wdregex[0].isnumeric(), wdregex
       pattern = re.compile(wdregex)
       wdmask = lambda params: {k: bool(pattern.search(k)) for k in params}
       chain.append(optax.add_decayed_weights(wd, wdmask))
     assert anneal > 0 or schedule == 'const'
+    # learning rate schedule
     if schedule == 'const':
       sched = optax.constant_schedule(lr)
     elif schedule == 'linear':
+      # linear decay from lr to 0.1 lr
       sched = optax.linear_schedule(lr, 0.1 * lr, anneal - warmup)
+      # same but cosine decay
     elif schedule == 'cosine':
-      sched = optax.cosine_decay_schedule(lr, anneal - warmup, 0.1 * lr)
+      sched = optax.cosine_decay_schedule(lr, anneal - warmup, 0.1 * lr) 
     else:
       raise NotImplementedError(schedule)
     if warmup:
-      ramp = optax.linear_schedule(0.0, lr, warmup)
-      sched = optax.join_schedules([ramp, sched], [warmup])
+      ramp = optax.linear_schedule(0.0, lr, warmup) # linear warm-up from 0 to lr
+      sched = optax.join_schedules([ramp, sched], [warmup]) # switch to lr schedule
     chain.append(optax.scale_by_learning_rate(sched))
     return optax.chain(*chain)
 
 
-# losses, raw lambda returns, and metrics
+# losses, raw lambda returns, and metrics;
+# regularize not only towards value estimation 
+# but also towards a slow EMA version of itself
 def imag_loss(
     act, rew, con,
     policy, value, slowvalue,
@@ -457,8 +485,8 @@ def imag_loss(
   val = value.pred() * vscale + voffset
   slowval = slowvalue.pred() * vscale + voffset
   tarval = slowval if slowtar else val
-  disc = 1 if contdisc else 1 - 1 / horizon # discount factor
-  weight = jnp.cumprod(disc * con, 1) / disc
+  disc = 1 if contdisc else 1 - 1 / horizon # 1
+  weight = jnp.cumprod(disc * con, 1) / disc # cumprod(con)
   last = jnp.zeros_like(con)
   term = 1 - con # terminal
   # lambda return 
@@ -510,6 +538,7 @@ def imag_loss(
   return losses, outs, metrics
 
 
+# off-policy with imag 'ret' and obs['rew']
 # details refer to imag_loss 
 # which holds sort of the same workflow
 def repl_loss(
@@ -528,8 +557,10 @@ def repl_loss(
   val = value.pred() * vscale + voffset
   slowval = slowvalue.pred() * vscale + voffset
   tarval = slowval if slowtar else val
+  # diff from imag_loss(~): disc and weight
   disc = 1 - 1 / horizon
   weight = f32(~last)
+  # lambda return
   ret = lambda_return(last, term, rew, tarval, boot, disc, lam)
 
   voffset, vscale = valnorm(ret, update)
@@ -537,7 +568,7 @@ def repl_loss(
   ret_padded = jnp.concatenate([ret_normed, 0 * ret_normed[:, -1:]], 1)
   losses['repval'] = weight[:, :-1] * (
       value.loss(sg(ret_padded)) +
-      slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
+      slowreg * value.loss(sg(slowvalue.pred())))[:, :-1] # same as imag_loss
 
   outs = {}
   outs['ret'] = ret
