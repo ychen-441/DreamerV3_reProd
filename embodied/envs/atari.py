@@ -14,6 +14,7 @@ from PIL import Image
 class Atari(embodied.Env):
 
   LOCK = threading.Lock()
+  # weights for converting RGB to greyscale
   WEIGHTS = np.array([0.299, 0.587, 1 - (0.299 + 0.587)])
   ACTION_MEANING = (
       'NOOP', 'FIRE', 'UP', 'RIGHT', 'LEFT', 'DOWN', 'UPRIGHT', 'UPLEFT',
@@ -31,12 +32,19 @@ class Atari(embodied.Env):
     assert aggregate in ('max', 'mean'), aggregate
     assert pooling >= 1, pooling
     assert repeat >= 1, repeat
+    # james bond act_space's a subset of ACTION_MEANING?
+    # ale_py doc def: james_bond_actspace[18]
+    # while actual op might be [6] (noop, 4 manips, fire), 
+    # or [10] with redundant manips, [11] with 'upright_fire'
     if name == 'james_bond':
       name = 'jamesbond'
 
+    # sticky action: might repeat prev_act
+    # possible response delay or imperfect control
+    # -> robustness, generalized policy
     self.repeat = repeat
     self.size = size
-    self.gray = gray
+    self.gray = gray # grayscale
     self.noops = noops
     self.lives = lives
     self.sticky = sticky
@@ -61,7 +69,7 @@ class Atari(embodied.Env):
     self.ale.setFloat('repeat_action_probability', 0.25 if sticky else 0.0)
     self.actionset = {
         'all': self.ale.getLegalActionSet,
-        'needed': self.ale.getMinimalActionSet,
+        'needed': self.ale.getMinimalActionSet, # should be [6] for jb
     }[actions]()
 
     W, H = self.ale.getScreenDims()
@@ -70,7 +78,7 @@ class Atari(embodied.Env):
         maxlen=self.pooling)
     self.prevlives = None
     self.duration = None
-    self.done = True
+    self.done = True # current episode ends or not
 
   @property
   def obs_space(self):
@@ -92,10 +100,11 @@ class Atari(embodied.Env):
   def step(self, action):
     if action['reset'] or self.done:
       self._reset()
-      self.prevlives = self.ale.lives()
-      self.duration = 0
+      self.prevlives = self.ale.lives() # extract lives agent still has
+      self.duration = 0 # reset counter
       self.done = False
       return self._obs(0.0, is_first=True)
+
     reward = 0.0
     terminal = False
     last = False
@@ -104,6 +113,8 @@ class Atari(embodied.Env):
     for repeat in range(self.repeat):
       reward += self.ale.act(act)
       self.duration += 1
+      # store and rendering the last 2 frames
+      # since Atari flickering sometimes, leading to info losses
       if repeat >= self.repeat - self.pooling:
         self._render()
       if self.ale.game_over():
@@ -120,7 +131,7 @@ class Atari(embodied.Env):
       self.prevlives = lives
       if terminal or last:
         break
-    self.done = last
+    self.done = last # True to reset
     obs = self._obs(reward, is_last=last, is_terminal=terminal)
     return obs
 
@@ -128,25 +139,30 @@ class Atari(embodied.Env):
     with self.LOCK:
       self.ale.reset_game()
     for _ in range(self.rng.integers(self.noops + 1)):
+      # perfroms random nums of noop
+      # introduce delay at start
       self.ale.act(self.ACTION_MEANING.index('NOOP'))
       if self.ale.game_over():
         with self.LOCK:
           self.ale.reset_game()
     if self.autostart and self.ACTION_MEANING.index('FIRE') in self.actionset:
+      # some games reuire fire to start
       self.ale.act(self.ACTION_MEANING.index('FIRE'))
       if self.ale.game_over():
         with self.LOCK:
           self.ale.reset_game()
+      # same, some need more than a press of fire
       self.ale.act(self.ACTION_MEANING.index('UP'))
       if self.ale.game_over():
         with self.LOCK:
           self.ale.reset_game()
-    self._render()
+    self._render() # render and store the initial frame
     for i, dst in enumerate(self.buffers):
       if i > 0:
         np.copyto(self.buffers[0], dst)
 
   def _render(self, reset=False):
+    # shift right and overwrite with the newest
     self.buffers.appendleft(self.buffers.pop())
     self.ale.getScreenRGB(self.buffers[0])
 
@@ -165,8 +181,10 @@ class Atari(embodied.Env):
       image = image.resize(self.size, Image.BILINEAR)
       image = np.array(image)
     if self.gray:
-      # Averaging channels equally would not work. For example, a fully red
-      # object on a fully green background would average to the same color.
+      # Danijar:
+      #   Averaging channels equally would not work. For example, a fully red
+      #   object on a fully green background would average to the same color.
+      # -> avg returns identical result instead of true blended color
       image = (image * self.WEIGHTS).sum(-1).astype(image.dtype)[:, :, None]
     return dict(
         image=image,
@@ -174,4 +192,4 @@ class Atari(embodied.Env):
         is_first=is_first,
         is_last=is_last,
         is_terminal=is_last,
-    )
+    ) # formatting obs result

@@ -131,7 +131,7 @@ def make_agent(config):
   obs_space = {k: v for k, v in env.obs_space.items() if notlog(k)}
   act_space = {k: v for k, v in env.act_space.items() if k != 'reset'}
   env.close()
-  if config.random_agent:
+  if config.random_agent: # False by default
     return embodied.RandomAgent(obs_space, act_space)
   cpdir = elements.Path(config.logdir)
   cpdir = cpdir.parent if config.replicas > 1 else cpdir

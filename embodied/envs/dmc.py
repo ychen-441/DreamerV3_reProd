@@ -23,18 +23,19 @@ class DMC(embodied.Env):
     if 'MUJOCO_GL' not in os.environ:
       os.environ['MUJOCO_GL'] = 'egl'
     if isinstance(env, str):
-      domain, task = env.split('_', 1)
+      domain, task = env.split('_', 1) # parse domain and task
       if camera == -1:
         camera = self.DEFAULT_CAMERAS.get(domain, 0)
-      if domain == 'cup':  # Only domain with multiple words.
+      if domain == 'cup':  # Danijar: Only domain with multiple words.
         domain = 'ball_in_cup'
       if domain == 'manip':
         env = manipulation.load(task + '_vision')
       elif domain == 'rodent':
-        # camera 0: topdown map
-        # camera 2: shoulder
-        # camera 4: topdown tracking
-        # camera 5: eyes
+        # Danijar:
+        #  camera 0: topdown map
+        #  camera 2: shoulder
+        #  camera 4: topdown tracking
+        #  camera 5: eyes
         env = getattr(basic_rodent_2020, task)()
       else:
         env = suite.load(domain, task)
@@ -63,6 +64,7 @@ class DMC(embodied.Env):
   def step(self, action):
     for key, space in self.act_space.items():
       if not space.discrete:
+        # check cont acts not NaN or inf
         assert np.isfinite(action[key]).all(), (key, action[key])
     obs = self._env.step(action)
     basic = ('is_first', 'is_last', 'is_terminal', 'reward')
@@ -71,6 +73,7 @@ class DMC(embodied.Env):
     key = 'image' if self._image else 'log/image'
     obs[key] = self._dmenv.physics.render(*self._size, camera_id=self._camera)
     for key, space in self.obs_space.items():
+      # check interoceptive data valid or not
       if np.issubdtype(space.dtype, np.floating):
         assert np.isfinite(obs[key]).all(), (key, obs[key])
     return obs
